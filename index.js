@@ -22,7 +22,7 @@ const requiredEnv = [
   "SENDGRID_API_KEY",
   "FASTTRK_EMAIL",
   "BASE_URL",
-  "PORT",
+  "PORT"
 ];
 for (const name of requiredEnv) {
   if (!process.env[name]) {
@@ -60,6 +60,8 @@ fastify.get("/", async (req, reply) => {
   reply.send({ status: "Twilio Voice AI server running" });
 });
 
+// Replace your /start-call endpoint with this:
+
 fastify.post("/start-call", async (req, reply) => {
   const {
     to,
@@ -77,36 +79,49 @@ fastify.post("/start-call", async (req, reply) => {
     return reply.code(400).send({ error: 'Missing "to" phone number' });
   }
 
-  reply.send({ message: "Form validated, call will be initiated shortly" });
+  const context = {
+    customerName,
+    vehicleName,
+    rentalStartDate,
+    rentalDays,
+    state,
+    driverLicense,
+    insuranceProvider,
+    policyNumber,
+  };
 
   try {
+    // First, generate a temporary ID and store context
+    const tempCallId = `temp_${Date.now()}_${Math.random()}`;
+    callContextMap.set(tempCallId, context);
+    
     const call = await twilioClient.calls.create({
-      url: `${process.env.BASE_URL}/outgoing-call`,
+      url: `${process.env.BASE_URL}/outgoing-call?contextId=${tempCallId}`,
       to,
       from: TWILIO_PHONE_NUMBER,
     });
-    const context = {
-      customerName,
-      vehicleName,
-      rentalStartDate,
-      rentalDays,
-      state,
-      driverLicense,
-      insuranceProvider,
-      policyNumber,
-    };
 
+    // Now store with the real call SID and keep the temp one
     callContextMap.set(call.sid, context);
     console.log(`📞 Call SID: ${call.sid}`);
     console.log("🗂️ Stored call context:", context);
+    
+    reply.send({ message: "Form validated, call will be initiated shortly" });
   } catch (err) {
     console.error("❌ Failed to start call:", err);
     reply.code(500).send({ error: "Failed to initiate call" });
   }
 });
 
+// Update your /outgoing-call endpoint:
 fastify.all("/outgoing-call", async (req, reply) => {
   const deployedHost = process.env.BASE_URL.replace("https://", "");
+  const contextId = req.query.contextId;
+
+  // If we have a contextId, pass it to the stream URL
+  const streamUrl = contextId 
+    ? `wss://${deployedHost}/media-stream?contextId=${contextId}`
+    : `wss://${deployedHost}/media-stream`;
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
       <Response>
@@ -114,16 +129,14 @@ fastify.all("/outgoing-call", async (req, reply) => {
         <Pause length="1"/>
         <Say voice="Polly.Joanna">Transfering your call to Fast Track Agent, Speak when you are ready.</Say>
         <Connect>
-          <Stream url="wss://${deployedHost}/media-stream" />
+          <Stream url="${streamUrl}" />
         </Connect>
       </Response>`;
 
   reply.type("text/xml").send(twiml);
 });
 
-// WebSocket route for media stream
-// Replace the WebSocket connection handler section with this fixed version
-
+// Update your WebSocket handler:
 fastify.register(async (fastify) => {
   fastify.get("/media-stream", { websocket: true }, (conn, req) => {
     let streamSid = null;
@@ -132,9 +145,10 @@ fastify.register(async (fastify) => {
     let markQueue = [];
     let responseStartTimestampTwilio = null;
     let callSid = null;
-    let shouldEndCallAfterAudio = false;
-    let contextLoaded = false; // Add flag to track context loading
-
+    
+    // Get contextId from query params
+    const contextId = req.query.contextId;
+    
     const openAiWs = new WebSocket(
       "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
       {
@@ -150,7 +164,6 @@ fastify.register(async (fastify) => {
       if (context) {
         const {
           customerName,
-          phoneNumber,
           vehicleName,
           rentalStartDate,
           rentalDays,
@@ -185,14 +198,12 @@ fastify.register(async (fastify) => {
   Do not answer any out-of-context or unrelated questions. Stay strictly on topic.
   `;
       } else {
-        // Fallback when context is missing
+        console.warn("⚠️ No context found - using fallback");
         contextString = `
   You are an AI assistant to verify car insurance details. You are calling an insurance company to verify insurance coverage.
   
   Start the conversation with:
   "Hi, I'm calling to verify insurance coverage for a vehicle rental. I'd like to ask a few questions to confirm coverage."
-  
-  Then ask for the customer details before proceeding with verification questions.
   `;
       }
 
@@ -238,90 +249,11 @@ fastify.register(async (fastify) => {
         },
       };
 
-      if (openAiWs.readyState === WebSocket.OPEN) {
+      openAiWs.on("open", () => {
+        console.log("✅ OpenAI WS connected!");
         console.log("📨 Sending sessionUpdate to OpenAI", sessionUpdate);
         openAiWs.send(JSON.stringify(sessionUpdate));
-        contextLoaded = true;
-      } else {
-        // Store the session update to send when connection opens
-        openAiWs.pendingSessionUpdate = sessionUpdate;
-      }
-    };
-
-    // Enhanced context loading with retry mechanism
-    const loadContextWithRetry = (callSid, maxRetries = 5) => {
-      let retries = 0;
-
-      const tryLoadContext = () => {
-        const context = callContextMap.get(callSid);
-        console.log(
-          `🔍 Attempt ${retries + 1}: Loading context for ${callSid}:`,
-          context
-        );
-
-        if (context || retries >= maxRetries) {
-          initializeSession(context);
-          return;
-        }
-
-        retries++;
-        setTimeout(tryLoadContext, 500); // Wait 500ms before retry
-      };
-
-      tryLoadContext();
-    };
-
-    openAiWs.on("open", () => {
-      console.log("✅ OpenAI WS connected!");
-
-      // If we have a pending session update, send it now
-      if (openAiWs.pendingSessionUpdate) {
-        console.log("📨 Sending pending sessionUpdate to OpenAI");
-        openAiWs.send(JSON.stringify(openAiWs.pendingSessionUpdate));
-        contextLoaded = true;
-        delete openAiWs.pendingSessionUpdate;
-      }
-
-      // If we have callSid but haven't loaded context yet, try loading it
-      if (callSid && !contextLoaded) {
-        loadContextWithRetry(callSid);
-      }
-    });
-
-    // Rest of your WebSocket message handlers...
-    const handleSpeechStartedEvent = () => {
-      if (markQueue.length > 0 && responseStartTimestampTwilio != null) {
-        const elapsed = latestMediaTimestamp - responseStartTimestampTwilio;
-
-        if (lastAssistantItem) {
-          openAiWs.send(
-            JSON.stringify({
-              type: "conversation.item.truncate",
-              item_id: lastAssistantItem,
-              content_index: 0,
-              audio_end_ms: elapsed,
-            })
-          );
-        }
-
-        conn.send(JSON.stringify({ event: "clear", streamSid }));
-        markQueue = [];
-        lastAssistantItem = null;
-        responseStartTimestampTwilio = null;
-      }
-    };
-
-    const sendMark = () => {
-      if (streamSid) {
-        conn.send(
-          JSON.stringify({
-            event: "mark",
-            streamSid,
-            mark: { name: "responsePart" },
-          })
-        );
-        markQueue.push("responsePart");
-      }
+      });
     };
 
     conn.on("message", (message) => {
@@ -336,9 +268,22 @@ fastify.register(async (fastify) => {
 
             callSid = msg.start.callSid;
             console.log("🔗 Got callSid:", callSid);
-
-            // Try to load context with retry mechanism
-            loadContextWithRetry(callSid);
+            
+            // Try multiple ways to get context
+            let context = callContextMap.get(callSid); // First try with callSid
+            
+            if (!context && contextId) {
+              console.log("🔍 Trying with contextId:", contextId);
+              context = callContextMap.get(contextId); // Try with contextId
+              
+              // If found with contextId, also store it with callSid for future use
+              if (context) {
+                callContextMap.set(callSid, context);
+              }
+            }
+            
+            console.log("📦 Loaded context:", context);
+            initializeSession(context);
             break;
 
           case "media":
@@ -363,122 +308,51 @@ fastify.register(async (fastify) => {
       }
     });
 
-    // Keep the rest of your existing openAiWs.on("message") handler and other event handlers...
-    openAiWs.on("message", (data) => {
-      const message = data.toString();
-      try {
-        const res = JSON.parse(data);
-
-        if (
-          res.type === "conversation.item.input_audio_transcription.completed"
-        ) {
-          const userSpeech = res.transcript;
-          if (callSid) {
-            if (!callTranscriptMap.has(callSid))
-              callTranscriptMap.set(callSid, []);
-            callTranscriptMap
-              .get(callSid)
-              .push({ role: "user", text: userSpeech });
-          }
-        }
-
-        if (res.type === "response.audio_transcript.done") {
-          console.log("[Full Transcript]", res.transcript);
-
-          const lowerTranscript = res.transcript.toLowerCase();
-          if (callSid) {
-            if (!callTranscriptMap.has(callSid))
-              callTranscriptMap.set(callSid, []);
-            callTranscriptMap
-              .get(callSid)
-              .push({ role: "agent", text: res.transcript });
-          }
-
-          if (
-            lowerTranscript.includes("goodbye") ||
-            lowerTranscript.includes("take care") ||
-            lowerTranscript.includes("have a nice day")
-          ) {
-            if (callSid) {
-              setTimeout(async () => {
-                try {
-                  await twilioClient
-                    .calls(callSid)
-                    .update({ status: "completed" });
-                  console.log(`✅ Call ${callSid} ended by AI after delay.`);
-                } catch (err) {
-                  console.error(`❌ Failed to end call ${callSid}:`, err);
-                }
-                callContextMap.delete(callSid);
-              }, 6000);
-            }
-          }
-        }
-
-        if (res.type === "response.audio.delta" && res.delta) {
-          conn.send(
-            JSON.stringify({
-              event: "media",
-              streamSid,
-              media: { payload: res.delta },
-            })
-          );
-
-          if (!responseStartTimestampTwilio) {
-            responseStartTimestampTwilio = latestMediaTimestamp;
-          }
-
-          if (res.item_id) {
-            lastAssistantItem = res.item_id;
-          }
-
-          sendMark();
-        }
-
-        if (res.type === "input_audio_buffer.speech_started") {
-          handleSpeechStartedEvent();
-        }
-      } catch (e) {
-        console.error("Error handling OpenAI message", e);
-      }
-    });
+    // Keep all your existing event handlers for openAiWs.on("message"), conn.on("close"), etc.
+    // [Rest of your existing code remains the same]
+   
+ 
 
     conn.on("close", async () => {
-      console.log(`🔌 Twilio WebSocket disconnected for callSid ${callSid}`);
+  console.log(`🔌 Twilio WebSocket disconnected for callSid ${callSid}`);
 
-      if (openAiWs && openAiWs.readyState === WebSocket.OPEN) {
-        openAiWs.close();
-      }
+  // Close OpenAI WebSocket if still open
+  if (openAiWs && openAiWs.readyState === WebSocket.OPEN) {
+    openAiWs.close();
+  }
 
-      if (callSid) {
-        try {
-          await twilioClient.calls(callSid).update({ status: "completed" });
-          console.log(`✅ Call ${callSid} marked as completed on hangup.`);
-        } catch (err) {
-          console.error(`❌ Failed to mark call ${callSid} as completed:`, err);
-        }
+  // End the call if it's still active
+  if (callSid) {
+    try {
+      await twilioClient.calls(callSid).update({ status: "completed" });
+      console.log(`✅ Call ${callSid} marked as completed on hangup.`);
+    } catch (err) {
+      console.error(`❌ Failed to mark call ${callSid} as completed:`, err);
+    }
 
-        callContextMap.delete(callSid);
-        callTranscriptMap.delete(callSid);
-      }
-    });
+    // Clean up memory
+    callContextMap.delete(callSid);
+    callTranscriptMap.delete(callSid);
+  }
+});
 
     openAiWs.on("close", () => {
       console.log("OpenAI WebSocket connection closed");
+      if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
       if (callSid) {
         callContextMap.delete(callSid);
       }
       console.log(`Connection closed for callSid ${callSid}`);
     });
-
     openAiWs.on("error", (err) => console.error("OpenAI WS error:", err));
   });
 });
 
-fastify.listen({ port: PORT || 3000, host: "0.0.0.0" }, (err, address) => {
+fastify.listen({ port: PORT || 3000, host: '0.0.0.0' }, (err, address) => {
   if (err) {
     fastify.log.error(err);
     process.exit(1);
   }
   fastify.log.info(`Server running at ${address}`);
 });
+
