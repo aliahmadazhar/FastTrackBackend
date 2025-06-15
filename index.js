@@ -22,7 +22,7 @@ const requiredEnv = [
   "SENDGRID_API_KEY",
   "FASTTRK_EMAIL",
   "BASE_URL",
-  "PORT"
+  "PORT",
 ];
 for (const name of requiredEnv) {
   if (!process.env[name]) {
@@ -77,33 +77,51 @@ fastify.post("/start-call", async (req, reply) => {
     return reply.code(400).send({ error: 'Missing "to" phone number' });
   }
 
-  reply.send({ message: "Form validated, call will be initiated shortly" });
+  // Save context temporarily using the phone number
+  const context = {
+    customerName,
+    vehicleName,
+    rentalStartDate,
+    rentalDays,
+    state,
+    driverLicense,
+    insuranceProvider,
+    policyNumber,
+  };
+
+  callContextMap.set(to, context);
 
   try {
     const call = await twilioClient.calls.create({
-       url: `${process.env.BASE_URL}/outgoing-call`,
+      url: `${process.env.BASE_URL}/outgoing-call`,
       to,
       from: TWILIO_PHONE_NUMBER,
+      statusCallback: `${process.env.BASE_URL}/call-status`,
+      statusCallbackMethod: "POST",
+      statusCallbackEvent: ["initiated", "ringing", "answered"],
     });
-    const context = {
-      customerName,
-      vehicleName,
-      rentalStartDate,
-      rentalDays,
-      state,
-      driverLicense,
-      insuranceProvider,
-      policyNumber,
-    };
 
-    callContextMap.set(call.sid, context);
-    console.log(`📞 Call SID: ${call.sid}`);
-    console.log("🗂️ Stored call context:", context);
+    reply.send({ message: "Call initiated", sid: call.sid });
   } catch (err) {
     console.error("❌ Failed to start call:", err);
     reply.code(500).send({ error: "Failed to initiate call" });
   }
 });
+fastify.post("/call-status", async (req, reply) => {
+  const { CallSid, To } = req.body;
+
+  const context = callContextMap.get(To); // fetched using phone number
+  if (context) {
+    callContextMap.set(CallSid, context); // now store it using real CallSid
+    console.log("📦 Bound context to CallSid:", CallSid);
+     callContextMap.delete(To); // ✅ clean up temp storage
+  } else {
+    console.warn(`⚠️ No temp context found for number ${To}`);
+  }
+
+  reply.send();
+});
+
 
 fastify.all("/outgoing-call", async (req, reply) => {
   const deployedHost = process.env.BASE_URL.replace("https://", "");
@@ -295,7 +313,7 @@ fastify.register(async (fastify) => {
           if (callSid) {
             if (!callTranscriptMap.has(callSid))
               callTranscriptMap.set(callSid, []);
-              callTranscriptMap
+            callTranscriptMap
               .get(callSid)
               .push({ role: "agent", text: res.transcript });
           }
@@ -421,11 +439,27 @@ fastify.register(async (fastify) => {
       }
     });
 
-    conn.on("close", () => {
-      if (callSid) {
-        callContextMap.delete(callSid);
+    conn.on("close", async () => {
+      console.log(`🔌 Twilio WebSocket disconnected for callSid ${callSid}`);
+
+      // Close OpenAI WebSocket if still open
+      if (openAiWs && openAiWs.readyState === WebSocket.OPEN) {
+        openAiWs.close();
       }
-      console.log(`Connection closed for callSid ${callSid}`);
+
+      // End the call if it's still active
+      if (callSid) {
+        try {
+          await twilioClient.calls(callSid).update({ status: "completed" });
+          console.log(`✅ Call ${callSid} marked as completed on hangup.`);
+        } catch (err) {
+          console.error(`❌ Failed to mark call ${callSid} as completed:`, err);
+        }
+
+        // Clean up memory
+        callContextMap.delete(callSid);
+        callTranscriptMap.delete(callSid);
+      }
     });
 
     openAiWs.on("close", () => {
@@ -440,11 +474,10 @@ fastify.register(async (fastify) => {
   });
 });
 
-fastify.listen({ port: PORT || 3000, host: '0.0.0.0' }, (err, address) => {
+fastify.listen({ port: PORT || 3000, host: "0.0.0.0" }, (err, address) => {
   if (err) {
     fastify.log.error(err);
     process.exit(1);
   }
   fastify.log.info(`Server running at ${address}`);
 });
-
