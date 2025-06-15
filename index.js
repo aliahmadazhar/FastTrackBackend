@@ -11,6 +11,25 @@ const callContextMap = new Map(); // Stores context per callSid
 const callTranscriptMap = new Map(); // Stores [{ role, text }] per callSid
 
 dotenv.config({ path: ".env" });
+const requiredEnv = [
+  "OPENAI_API_KEY",
+  "TWILIO_AUTH_TOKEN",
+  "TWILIO_ACCOUNT_SID",
+  "TWILIO_PHONE_NUMBER",
+  "STREAM_URL",
+  "ELEVENLABS_API_KEY",
+  "ELEVENLABS_VOICE_ID",
+  "SENDGRID_API_KEY",
+  "FASTTRK_EMAIL",
+  "BASE_URL",
+  "PORT"
+];
+for (const name of requiredEnv) {
+  if (!process.env[name]) {
+    console.error(`❌ Missing env variable: ${name}`);
+    process.exit(1);
+  }
+}
 const {
   OPENAI_API_KEY,
   PORT = 3000,
