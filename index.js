@@ -276,6 +276,7 @@ fastify.register(async (fastify) => {
           if (callSid) {
             if (!callTranscriptMap.has(callSid))
               callTranscriptMap.set(callSid, []);
+              callTranscriptMap
               .get(callSid)
               .push({ role: "agent", text: res.transcript });
           }
