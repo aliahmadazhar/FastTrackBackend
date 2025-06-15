@@ -60,8 +60,6 @@ fastify.get("/", async (req, reply) => {
   reply.send({ status: "Twilio Voice AI server running" });
 });
 
-// Replace your /start-call endpoint with this:
-
 fastify.post("/start-call", async (req, reply) => {
   const {
     to,
@@ -79,49 +77,36 @@ fastify.post("/start-call", async (req, reply) => {
     return reply.code(400).send({ error: 'Missing "to" phone number' });
   }
 
-  const context = {
-    customerName,
-    vehicleName,
-    rentalStartDate,
-    rentalDays,
-    state,
-    driverLicense,
-    insuranceProvider,
-    policyNumber,
-  };
+  reply.send({ message: "Form validated, call will be initiated shortly" });
 
   try {
-    // First, generate a temporary ID and store context
-    const tempCallId = `temp_${Date.now()}_${Math.random()}`;
-    callContextMap.set(tempCallId, context);
-    
     const call = await twilioClient.calls.create({
-      url: `${process.env.BASE_URL}/outgoing-call?contextId=${tempCallId}`,
+       url: `${process.env.BASE_URL}/outgoing-call`,
       to,
       from: TWILIO_PHONE_NUMBER,
     });
+    const context = {
+      customerName,
+      vehicleName,
+      rentalStartDate,
+      rentalDays,
+      state,
+      driverLicense,
+      insuranceProvider,
+      policyNumber,
+    };
 
-    // Now store with the real call SID and keep the temp one
     callContextMap.set(call.sid, context);
     console.log(`📞 Call SID: ${call.sid}`);
     console.log("🗂️ Stored call context:", context);
-    
-    reply.send({ message: "Form validated, call will be initiated shortly" });
   } catch (err) {
     console.error("❌ Failed to start call:", err);
     reply.code(500).send({ error: "Failed to initiate call" });
   }
 });
 
-// Update your /outgoing-call endpoint:
 fastify.all("/outgoing-call", async (req, reply) => {
   const deployedHost = process.env.BASE_URL.replace("https://", "");
-  const contextId = req.query.contextId;
-
-  // If we have a contextId, pass it to the stream URL
-  const streamUrl = contextId 
-    ? `wss://${deployedHost}/media-stream?contextId=${contextId}`
-    : `wss://${deployedHost}/media-stream`;
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
       <Response>
@@ -129,14 +114,14 @@ fastify.all("/outgoing-call", async (req, reply) => {
         <Pause length="1"/>
         <Say voice="Polly.Joanna">Transfering your call to Fast Track Agent, Speak when you are ready.</Say>
         <Connect>
-          <Stream url="${streamUrl}" />
+          <Stream url="wss://${deployedHost}/media-stream" />
         </Connect>
       </Response>`;
 
   reply.type("text/xml").send(twiml);
 });
 
-// Update your WebSocket handler:
+// WebSocket route for media stream
 fastify.register(async (fastify) => {
   fastify.get("/media-stream", { websocket: true }, (conn, req) => {
     let streamSid = null;
@@ -145,10 +130,7 @@ fastify.register(async (fastify) => {
     let markQueue = [];
     let responseStartTimestampTwilio = null;
     let callSid = null;
-    
-    // Get contextId from query params
-    const contextId = req.query.contextId;
-    
+    let shouldEndCallAfterAudio = false;
     const openAiWs = new WebSocket(
       "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
       {
@@ -164,6 +146,7 @@ fastify.register(async (fastify) => {
       if (context) {
         const {
           customerName,
+          phoneNumber,
           vehicleName,
           rentalStartDate,
           rentalDays,
@@ -175,7 +158,7 @@ fastify.register(async (fastify) => {
 
         console.log("📦 Context received:", context);
         contextString = `
-  You are an AI assistant to verify the person's car insurance details. You are calling insurance company to verify insurance coverage for ${customerName}.
+  You are and AI assistant to verfiy the persons car insurance details You are calling insurance comapnt to verify insurance coverage for ${customerName}.
   Here are the rental and insurance details:
 
   - Customer Name: ${customerName}
@@ -189,21 +172,13 @@ fastify.register(async (fastify) => {
 
   Start the conversation with a short, clear introduction like:
 
-  "Hi, I'm calling to verify insurance coverage for ${customerName}. They are renting a ${vehicleName} starting on ${rentalStartDate} for ${rentalDays} days in ${state}. I'd like to ask a few questions to confirm coverage."
+  "Hi, I’m calling to verify insurance coverage for ${customerName}. They are renting a ${vehicleName} starting on ${rentalStartDate} for ${rentalDays} days in ${state}. I’d like to ask a few questions to confirm coverage."
 
   After the introduction, follow the steps below one at a time.
   Ask **only one question at a time** and do **not proceed to the next until a valid answer is received**.
-  If the first question is not clearly answered or denied, please ask it again until you get that details.
-  If you get interrupted by the user during the conversation, respond to their query and then return to the verification questions.
+  If the first question is not clearly answered or denied, plesae ask it again ultil got that details.
+  If you get interrupted by the user during the conversation, respond to theri query and then return to the verification questions.
   Do not answer any out-of-context or unrelated questions. Stay strictly on topic.
-  `;
-      } else {
-        console.warn("⚠️ No context found - using fallback");
-        contextString = `
-  You are an AI assistant to verify car insurance details. You are calling an insurance company to verify insurance coverage.
-  
-  Start the conversation with:
-  "Hi, I'm calling to verify insurance coverage for a vehicle rental. I'd like to ask a few questions to confirm coverage."
   `;
       }
 
@@ -212,25 +187,26 @@ fastify.register(async (fastify) => {
 
   Verification questions (ask and wait for confirmation before continuing):
 
-  1. Can I provide you with their policy number and driver's license number to verify their policy?
-    - Only proceed if the agent confirms that they can verify using the policy number and driver's license.
+  1. Can I provide you with their policy number and driver’s license number to verify their policy?
+    - Only proceed if the agent confirms that they can verify using the policy number and driver’s license.
     - If the answer is unclear or denied, **end the verification attempt politely and do not continue.**
 
   2. Does this policy have full coverage or liability only?
 
-  3. Can you verify that the customer's policy will carry over to our rental vehicle and your company will cover comprehensive, collision, and/or physical damage to our vehicle while being rented — including theft or vandalism while in the renter's care and custody?
+  3. Can you verify that the customer’s policy will carry over to our rental vehicle and your company will cover comprehensive, collision, and/or physical damage to our vehicle while being rented — including theft or vandalism while in the renter’s care and custody?
 
-  4. Are you able to verify the renter's liability limit amounts and confirm that it will carry over as well?
+  4. Are you able to verify the renter’s liability limit amounts and confirm that it will carry over as well?
 
-  5. Can you confirm that they have an active policy that's been effective for more than 30 days? (If not, ask if it would still provide coverage.)
+  5. Can you confirm that they have an active policy that’s been effective for more than 30 days? (If not, ask if it would still provide coverage.)
 
   Once all answers are collected, say:
-  "Thank you for confirming and being of assistance today. Have a nice day, goodbye"
+  “Thank you for confirming and being of assistance today. Have a nice day, goodbye”
 
   Notes:
-  - If the user asks a question about the customer's policy, vehicle, dates, or license, you may respond based on the given data.
+  - If the user asks a question about the customer’s policy, vehicle, dates, or license, you may respond based on the given data.
   - Be polite, clear, and stick to one question at a time.
   - If the user asks about unrelated topics, politely redirect them back to the verification questions.
+  - o 
   `;
 
       const sessionUpdate = {
@@ -256,6 +232,155 @@ fastify.register(async (fastify) => {
       });
     };
 
+    const handleSpeechStartedEvent = () => {
+      if (markQueue.length > 0 && responseStartTimestampTwilio != null) {
+        const elapsed = latestMediaTimestamp - responseStartTimestampTwilio;
+
+        if (lastAssistantItem) {
+          openAiWs.send(
+            JSON.stringify({
+              type: "conversation.item.truncate",
+              item_id: lastAssistantItem,
+              content_index: 0,
+              audio_end_ms: elapsed,
+            })
+          );
+        }
+
+        conn.send(JSON.stringify({ event: "clear", streamSid }));
+        markQueue = [];
+        lastAssistantItem = null;
+        responseStartTimestampTwilio = null;
+      }
+    };
+
+    const sendMark = () => {
+      if (streamSid) {
+        conn.send(
+          JSON.stringify({
+            event: "mark",
+            streamSid,
+            mark: { name: "responsePart" },
+          })
+        );
+        markQueue.push("responsePart");
+      }
+    };
+
+    openAiWs.on("message", (data) => {
+      const message = data.toString(); // ✅ convert buffer to string
+      // console.log("📨 Got message from OpenAI:", message);
+
+      try {
+        const res = JSON.parse(data);
+        //  /   console.log(res);
+        // console.log("📨 OpenAI response:", res.type);
+        if (
+          res.type === "conversation.item.input_audio_transcription.completed"
+        ) {
+          const userSpeech = res.transcript;
+          if (callSid) {
+            if (!callTranscriptMap.has(callSid))
+              callTranscriptMap.set(callSid, []);
+            callTranscriptMap
+              .get(callSid)
+              .push({ role: "user", text: userSpeech });
+          }
+        }
+
+        if (res.type === "response.audio_transcript.done") {
+          console.log("[Full Transcript]", res.transcript);
+
+          const lowerTranscript = res.transcript.toLowerCase();
+          if (callSid) {
+            if (!callTranscriptMap.has(callSid))
+              callTranscriptMap.set(callSid, []);
+              callTranscriptMap
+              .get(callSid)
+              .push({ role: "agent", text: res.transcript });
+          }
+
+          // Check if the transcript includes any goodbye phrases
+          if (
+            lowerTranscript.includes("goodbye") ||
+            lowerTranscript.includes("take care") ||
+            lowerTranscript.includes("have a nice day")
+          ) {
+            if (callSid) {
+              //Let the audio to finish playing before ending the call 6 sec pause
+              setTimeout(async () => {
+                try {
+                  await twilioClient
+                    .calls(callSid)
+                    .update({ status: "completed" });
+                  console.log(`✅ Call ${callSid} ended by AI after delay.`);
+                } catch (err) {
+                  console.error(`❌ Failed to end call ${callSid}:`, err);
+                }
+                callContextMap.delete(callSid);
+
+                const conversation = callTranscriptMap.get(callSid);
+                // console.log(conversation)
+                // if (conversation) {
+                //   const formatted = conversation
+                //     .map(
+                //       (entry) =>
+                //         `${entry.role === "agent" ? "Agent" : "User"}: ${
+                //           entry.text
+                //         }`
+                //     )
+                //     .join("\n");
+
+                //   try {
+                //     await sgMail.send({
+                //       to: "youremail@example.com", // 🔁 Replace with your real email
+                //       from: "noreply@fasttrack.ai", // 🔁 Must be verified sender in SendGrid
+                //       subject: `Call Transcript for ${callSid}`,
+                //       text: formatted,
+                //     });
+
+                //     console.log(`📧 Transcript emailed for call ${callSid}`);
+                //   } catch (err) {
+                //     console.error("❌ Failed to send email:", err);
+                //   }
+
+                //   callTranscriptMap.delete(callSid);
+                // }
+              }, 6000);
+            } else {
+              console.warn(`⚠️ callSid is missing, cannot end call.`);
+            }
+          }
+        }
+
+        if (res.type === "response.audio.delta" && res.delta) {
+          conn.send(
+            JSON.stringify({
+              event: "media",
+              streamSid,
+              media: { payload: res.delta },
+            })
+          );
+
+          if (!responseStartTimestampTwilio) {
+            responseStartTimestampTwilio = latestMediaTimestamp;
+          }
+
+          if (res.item_id) {
+            lastAssistantItem = res.item_id;
+          }
+
+          sendMark();
+        }
+
+        if (res.type === "input_audio_buffer.speech_started") {
+          handleSpeechStartedEvent();
+        }
+      } catch (e) {
+        console.error("Error handling OpenAI message", e);
+      }
+    });
+
     conn.on("message", (message) => {
       try {
         const msg = JSON.parse(message);
@@ -267,22 +392,10 @@ fastify.register(async (fastify) => {
             latestMediaTimestamp = 0;
 
             callSid = msg.start.callSid;
+            const context = callContextMap.get(callSid);
             console.log("🔗 Got callSid:", callSid);
-            
-            // Try multiple ways to get context
-            let context = callContextMap.get(callSid); // First try with callSid
-            
-            if (!context && contextId) {
-              console.log("🔍 Trying with contextId:", contextId);
-              context = callContextMap.get(contextId); // Try with contextId
-              
-              // If found with contextId, also store it with callSid for future use
-              if (context) {
-                callContextMap.set(callSid, context);
-              }
-            }
-            
             console.log("📦 Loaded context:", context);
+
             initializeSession(context);
             break;
 
@@ -307,11 +420,6 @@ fastify.register(async (fastify) => {
         console.error("Error parsing message", e);
       }
     });
-
-    // Keep all your existing event handlers for openAiWs.on("message"), conn.on("close"), etc.
-    // [Rest of your existing code remains the same]
-   
- 
 
     conn.on("close", async () => {
   console.log(`🔌 Twilio WebSocket disconnected for callSid ${callSid}`);
