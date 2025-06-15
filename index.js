@@ -11,25 +11,6 @@ const callContextMap = new Map(); // Stores context per callSid
 const callTranscriptMap = new Map(); // Stores [{ role, text }] per callSid
 
 dotenv.config({ path: ".env" });
-const requiredEnv = [
-  "OPENAI_API_KEY",
-  "TWILIO_AUTH_TOKEN",
-  "TWILIO_ACCOUNT_SID",
-  "TWILIO_PHONE_NUMBER",
-  "STREAM_URL",
-  "ELEVENLABS_API_KEY",
-  "ELEVENLABS_VOICE_ID",
-  "SENDGRID_API_KEY",
-  "FASTTRK_EMAIL",
-  "BASE_URL",
-  "PORT"
-];
-for (const name of requiredEnv) {
-  if (!process.env[name]) {
-    console.error(`❌ Missing env variable: ${name}`);
-    process.exit(1);
-  }
-}
 const {
   OPENAI_API_KEY,
   PORT = 3000,
@@ -295,7 +276,7 @@ fastify.register(async (fastify) => {
           if (callSid) {
             if (!callTranscriptMap.has(callSid))
               callTranscriptMap.set(callSid, []);
-              callTranscriptMap
+            callTranscriptMap
               .get(callSid)
               .push({ role: "agent", text: res.transcript });
           }
@@ -421,28 +402,12 @@ fastify.register(async (fastify) => {
       }
     });
 
-    conn.on("close", async () => {
-  console.log(`🔌 Twilio WebSocket disconnected for callSid ${callSid}`);
-
-  // Close OpenAI WebSocket if still open
-  if (openAiWs && openAiWs.readyState === WebSocket.OPEN) {
-    openAiWs.close();
-  }
-
-  // End the call if it's still active
-  if (callSid) {
-    try {
-      await twilioClient.calls(callSid).update({ status: "completed" });
-      console.log(`✅ Call ${callSid} marked as completed on hangup.`);
-    } catch (err) {
-      console.error(`❌ Failed to mark call ${callSid} as completed:`, err);
-    }
-
-    // Clean up memory
-    callContextMap.delete(callSid);
-    callTranscriptMap.delete(callSid);
-  }
-});
+    conn.on("close", () => {
+      if (callSid) {
+        callContextMap.delete(callSid);
+      }
+      console.log(`Connection closed for callSid ${callSid}`);
+    });
 
     openAiWs.on("close", () => {
       console.log("OpenAI WebSocket connection closed");
