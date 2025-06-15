@@ -22,7 +22,7 @@ const requiredEnv = [
   "SENDGRID_API_KEY",
   "FASTTRK_EMAIL",
   "BASE_URL",
-  "PORT",
+  "PORT"
 ];
 for (const name of requiredEnv) {
   if (!process.env[name]) {
@@ -81,7 +81,7 @@ fastify.post("/start-call", async (req, reply) => {
 
   try {
     const call = await twilioClient.calls.create({
-      url: `${process.env.BASE_URL}/outgoing-call`,
+       url: `${process.env.BASE_URL}/outgoing-call`,
       to,
       from: TWILIO_PHONE_NUMBER,
     });
@@ -295,7 +295,7 @@ fastify.register(async (fastify) => {
           if (callSid) {
             if (!callTranscriptMap.has(callSid))
               callTranscriptMap.set(callSid, []);
-            callTranscriptMap
+              callTranscriptMap
               .get(callSid)
               .push({ role: "agent", text: res.transcript });
           }
@@ -393,8 +393,8 @@ fastify.register(async (fastify) => {
 
             callSid = msg.start.callSid;
             const context = callContextMap.get(callSid);
-            console.log("🔗 Got callSid from twilio:", callSid);
-            console.log("📦 Loaded context from twilio:", context);
+            console.log("🔗 Got callSid:", callSid);
+            console.log("📦 Loaded context:", context);
 
             initializeSession(context);
             break;
@@ -421,24 +421,13 @@ fastify.register(async (fastify) => {
       }
     });
 
-   conn.on("close", async () => {
-  console.log(`🔌 Twilio WebSocket disconnected for callSid ${callSid}`);
+    conn.on("close", () => {
+      if (callSid) {
+        callContextMap.delete(callSid);
+      }
+      console.log(`Connection closed for callSid ${callSid}`);
+    });
 
-  // Close OpenAI WebSocket if still open
-  if (openAiWs && openAiWs.readyState === WebSocket.OPEN) {
-    openAiWs.close();
-  }
-
-  // DO NOT DELETE CONTEXT HERE - ONLY END CALL IF NEEDED
-  if (callSid) {
-    try {
-      await twilioClient.calls(callSid).update({ status: "completed" });
-      console.log(`✅ Call ${callSid} marked as completed on hangup.`);
-    } catch (err) {
-      console.error(`❌ Failed to mark call ${callSid} as completed:`, err);
-    }
-  }
-});
     openAiWs.on("close", () => {
       console.log("OpenAI WebSocket connection closed");
       if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
@@ -451,10 +440,11 @@ fastify.register(async (fastify) => {
   });
 });
 
-fastify.listen({ port: PORT || 3000, host: "0.0.0.0" }, (err, address) => {
+fastify.listen({ port: PORT || 3000, host: '0.0.0.0' }, (err, address) => {
   if (err) {
     fastify.log.error(err);
     process.exit(1);
   }
   fastify.log.info(`Server running at ${address}`);
 });
+
