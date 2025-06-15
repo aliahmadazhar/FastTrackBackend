@@ -62,7 +62,8 @@ fastify.post("/start-call", async (req, reply) => {
 
   try {
     const call = await twilioClient.calls.create({
-      url: `https://${req.headers.host}/outgoing-call`,
+      url: `${process.env.BASE_URL}/outgoing-call`,
+
       to,
       from: TWILIO_PHONE_NUMBER,
     });
@@ -87,7 +88,8 @@ fastify.post("/start-call", async (req, reply) => {
 });
 
 fastify.all("/outgoing-call", async (req, reply) => {
-  const ngrokHost = "a343-154-80-37-39.ngrok-free.app";
+  const deployedHost = process.env.BASE_URL.replace("https://", "");
+
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
       <Response>
@@ -95,7 +97,7 @@ fastify.all("/outgoing-call", async (req, reply) => {
         <Pause length="1"/>
         <Say voice="Polly.Joanna">Transfering your call to Fast Track Agent, Speak when you are ready.</Say>
         <Connect>
-          <Stream url="wss://${ngrokHost}/media-stream" />
+          <Stream url="wss://${deployedHost}/media-stream" />
         </Connect>
       </Response>`;
 
@@ -301,7 +303,7 @@ fastify.register(async (fastify) => {
                 callContextMap.delete(callSid);
 
                 const conversation = callTranscriptMap.get(callSid);
-                console.log(conversation)
+                console.log(conversation);
                 // if (conversation) {
                 //   const formatted = conversation
                 //     .map(
@@ -421,7 +423,7 @@ fastify.register(async (fastify) => {
   });
 });
 
-fastify.listen({ port: PORT }, (err) => {
+fastify.listen({ port: PORT, host: "0.0.0.0" }, (err) => {
   if (err) {
     console.error(err);
     process.exit(1);
