@@ -1,5 +1,4 @@
 import Fastify from "fastify";
-
 import WebSocket from "ws";
 import dotenv from "dotenv";
 import fastifyFormBody from "@fastify/formbody";
@@ -8,6 +7,7 @@ import fastifyCors from "@fastify/cors";
 import twilio from "twilio";
 
 const callContextMap = new Map(); // Stores context per callSid
+const phoneContextMap = new Map(); // Stores context per phone number (backup)
 const callTranscriptMap = new Map(); // Stores [{ role, text }] per callSid
 
 dotenv.config({ path: ".env" });
@@ -24,12 +24,14 @@ const requiredEnv = [
   "BASE_URL",
   "PORT"
 ];
+
 for (const name of requiredEnv) {
   if (!process.env[name]) {
     console.error(`❌ Missing env variable: ${name}`);
     process.exit(1);
   }
 }
+
 const {
   OPENAI_API_KEY,
   PORT = 3000,
@@ -77,28 +79,42 @@ fastify.post("/start-call", async (req, reply) => {
     return reply.code(400).send({ error: 'Missing "to" phone number' });
   }
 
-  reply.send({ message: "Form validated, call will be initiated shortly" });
+  const context = {
+    customerName,
+    vehicleName,
+    rentalStartDate,
+    rentalDays,
+    state,
+    driverLicense,
+    insuranceProvider,
+    policyNumber,
+    phoneNumber: to,
+    timestamp: Date.now(),
+  };
 
   try {
     const call = await twilioClient.calls.create({
-       url: `${process.env.BASE_URL}/outgoing-call`,
+      url: `${process.env.BASE_URL}/outgoing-call?to=${encodeURIComponent(to)}`,
       to,
       from: TWILIO_PHONE_NUMBER,
     });
-    const context = {
-      customerName,
-      vehicleName,
-      rentalStartDate,
-      rentalDays,
-      state,
-      driverLicense,
-      insuranceProvider,
-      policyNumber,
-    };
 
+    // Store context in both maps for reliability
     callContextMap.set(call.sid, context);
-    console.log(`📞 Call SID: ${call.sid}`);
+    phoneContextMap.set(to, context);
+    
+    console.log("=== DEBUG INFO ===");
+    console.log("📞 Call SID:", call.sid);
+    console.log("📞 Phone number:", to);
     console.log("🗂️ Stored call context:", context);
+    console.log("📊 Total contexts stored:", callContextMap.size);
+    console.log("==================");
+    
+    reply.send({ 
+      message: "Form validated, call will be initiated shortly",
+      callSid: call.sid 
+    });
+    
   } catch (err) {
     console.error("❌ Failed to start call:", err);
     reply.code(500).send({ error: "Failed to initiate call" });
@@ -107,6 +123,7 @@ fastify.post("/start-call", async (req, reply) => {
 
 fastify.all("/outgoing-call", async (req, reply) => {
   const deployedHost = process.env.BASE_URL.replace("https://", "");
+  const phoneNumber = req.query.to;
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
       <Response>
@@ -114,7 +131,7 @@ fastify.all("/outgoing-call", async (req, reply) => {
         <Pause length="1"/>
         <Say voice="Polly.Joanna">Transfering your call to Fast Track Agent, Speak when you are ready.</Say>
         <Connect>
-          <Stream url="wss://${deployedHost}/media-stream" />
+          <Stream url="wss://${deployedHost}/media-stream${phoneNumber ? `?phone=${encodeURIComponent(phoneNumber)}` : ''}" />
         </Connect>
       </Response>`;
 
@@ -130,7 +147,13 @@ fastify.register(async (fastify) => {
     let markQueue = [];
     let responseStartTimestampTwilio = null;
     let callSid = null;
+    let context = null;
     let shouldEndCallAfterAudio = false;
+
+    // Extract phone number from query params
+    const phoneNumber = req.query.phone;
+    console.log("🔗 WebSocket connection established, phone:", phoneNumber);
+
     const openAiWs = new WebSocket(
       "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
       {
@@ -141,12 +164,49 @@ fastify.register(async (fastify) => {
       }
     );
 
+    const findContext = (callSid, phoneNumber) => {
+      console.log("🔍 Searching for context...");
+      console.log("🔍 CallSid:", callSid);
+      console.log("🔍 PhoneNumber:", phoneNumber);
+      
+      // Try to get context by callSid first
+      let foundContext = callContextMap.get(callSid);
+      if (foundContext) {
+        console.log(`✅ Context found by callSid: ${callSid}`);
+        return foundContext;
+      }
+
+      // Fallback: try to get context by phone number
+      if (phoneNumber) {
+        foundContext = phoneContextMap.get(phoneNumber);
+        if (foundContext) {
+          console.log(`✅ Context found by phone number: ${phoneNumber}`);
+          // Store it in callContextMap for future reference
+          callContextMap.set(callSid, foundContext);
+          return foundContext;
+        }
+      }
+
+      // Last resort: try to find by matching phone number in all contexts
+      for (const [key, ctx] of callContextMap.entries()) {
+        if (ctx.phoneNumber === phoneNumber) {
+          console.log(`✅ Context found by phone number match: ${phoneNumber}`);
+          return ctx;
+        }
+      }
+
+      console.error(`❌ No context found for callSid: ${callSid}, phone: ${phoneNumber}`);
+      console.log(`📊 Available contexts by callSid:`, Array.from(callContextMap.keys()));
+      console.log(`📊 Available contexts by phone:`, Array.from(phoneContextMap.keys()));
+      
+      return null;
+    };
+
     const initializeSession = (context) => {
       let contextString = "";
       if (context) {
         const {
           customerName,
-          phoneNumber,
           vehicleName,
           rentalStartDate,
           rentalDays,
@@ -156,58 +216,64 @@ fastify.register(async (fastify) => {
           policyNumber,
         } = context;
 
-        console.log("📦 Context received:", context);
+        console.log("📦 Context successfully loaded:", context);
         contextString = `
-  You are and AI assistant to verfiy the persons car insurance details You are calling insurance comapnt to verify insurance coverage for ${customerName}.
-  Here are the rental and insurance details:
+You are an AI assistant to verify the person's car insurance details. You are calling insurance company to verify insurance coverage for ${customerName}.
+Here are the rental and insurance details:
 
-  - Customer Name: ${customerName}
-  - Vehicle: ${vehicleName}
-  - Rental start date: ${rentalStartDate}
-  - Rental duration: ${rentalDays} days
-  - State: ${state}
-  - Driver License: ${driverLicense}
-  - Insurance Provider: ${insuranceProvider}
-  - Policy Number: ${policyNumber}
+- Customer Name: ${customerName}
+- Vehicle: ${vehicleName}
+- Rental start date: ${rentalStartDate}
+- Rental duration: ${rentalDays} days
+- State: ${state}
+- Driver License: ${driverLicense}
+- Insurance Provider: ${insuranceProvider}
+- Policy Number: ${policyNumber}
 
-  Start the conversation with a short, clear introduction like:
+Start the conversation with a short, clear introduction like:
 
-  "Hi, I’m calling to verify insurance coverage for ${customerName}. They are renting a ${vehicleName} starting on ${rentalStartDate} for ${rentalDays} days in ${state}. I’d like to ask a few questions to confirm coverage."
+"Hi, I'm calling to verify insurance coverage for ${customerName}. They are renting a ${vehicleName} starting on ${rentalStartDate} for ${rentalDays} days in ${state}. I'd like to ask a few questions to confirm coverage."
 
-  After the introduction, follow the steps below one at a time.
-  Ask **only one question at a time** and do **not proceed to the next until a valid answer is received**.
-  If the first question is not clearly answered or denied, plesae ask it again ultil got that details.
-  If you get interrupted by the user during the conversation, respond to theri query and then return to the verification questions.
-  Do not answer any out-of-context or unrelated questions. Stay strictly on topic.
-  `;
+After the introduction, follow the steps below one at a time.
+Ask **only one question at a time** and do **not proceed to the next until a valid answer is received**.
+If the first question is not clearly answered or denied, please ask it again until got that details.
+If you get interrupted by the user during the conversation, respond to their query and then return to the verification questions.
+Do not answer any out-of-context or unrelated questions. Stay strictly on topic.
+`;
+      } else {
+        console.error("❌ No context available for session initialization");
+        contextString = `
+You are an AI assistant for insurance verification. However, I don't have the customer details for this call. 
+Please ask the caller to provide their policy number and customer information so I can assist with the verification process.
+Say: "I apologize, but I don't have your customer details loaded. Could you please provide me with your policy number and customer name so I can assist you with the insurance verification?"
+`;
       }
 
       const SYSTEM_MESSAGE = `
-  ${contextString}
+${contextString}
 
-  Verification questions (ask and wait for confirmation before continuing):
+Verification questions (ask and wait for confirmation before continuing):
 
-  1. Can I provide you with their policy number and driver’s license number to verify their policy?
-    - Only proceed if the agent confirms that they can verify using the policy number and driver’s license.
-    - If the answer is unclear or denied, **end the verification attempt politely and do not continue.**
+1. Can I provide you with their policy number and driver's license number to verify their policy?
+   - Only proceed if the agent confirms that they can verify using the policy number and driver's license.
+   - If the answer is unclear or denied, **end the verification attempt politely and do not continue.**
 
-  2. Does this policy have full coverage or liability only?
+2. Does this policy have full coverage or liability only?
 
-  3. Can you verify that the customer’s policy will carry over to our rental vehicle and your company will cover comprehensive, collision, and/or physical damage to our vehicle while being rented — including theft or vandalism while in the renter’s care and custody?
+3. Can you verify that the customer's policy will carry over to our rental vehicle and your company will cover comprehensive, collision, and/or physical damage to our vehicle while being rented — including theft or vandalism while in the renter's care and custody?
 
-  4. Are you able to verify the renter’s liability limit amounts and confirm that it will carry over as well?
+4. Are you able to verify the renter's liability limit amounts and confirm that it will carry over as well?
 
-  5. Can you confirm that they have an active policy that’s been effective for more than 30 days? (If not, ask if it would still provide coverage.)
+5. Can you confirm that they have an active policy that's been effective for more than 30 days? (If not, ask if it would still provide coverage.)
 
-  Once all answers are collected, say:
-  “Thank you for confirming and being of assistance today. Have a nice day, goodbye”
+Once all answers are collected, say:
+"Thank you for confirming and being of assistance today. Have a nice day, goodbye"
 
-  Notes:
-  - If the user asks a question about the customer’s policy, vehicle, dates, or license, you may respond based on the given data.
-  - Be polite, clear, and stick to one question at a time.
-  - If the user asks about unrelated topics, politely redirect them back to the verification questions.
-  - o 
-  `;
+Notes:
+- If the user asks a question about the customer's policy, vehicle, dates, or license, you may respond based on the given data.
+- Be polite, clear, and stick to one question at a time.
+- If the user asks about unrelated topics, politely redirect them back to the verification questions.
+`;
 
       const sessionUpdate = {
         type: "session.update",
@@ -227,7 +293,7 @@ fastify.register(async (fastify) => {
 
       openAiWs.on("open", () => {
         console.log("✅ OpenAI WS connected!");
-        console.log("📨 Sending sessionUpdate to OpenAI", sessionUpdate);
+        console.log("📨 Sending sessionUpdate to OpenAI");
         openAiWs.send(JSON.stringify(sessionUpdate));
       });
     };
@@ -268,13 +334,11 @@ fastify.register(async (fastify) => {
     };
 
     openAiWs.on("message", (data) => {
-      const message = data.toString(); // ✅ convert buffer to string
-      // console.log("📨 Got message from OpenAI:", message);
+      const message = data.toString();
 
       try {
         const res = JSON.parse(data);
-        //  /   console.log(res);
-        // console.log("📨 OpenAI response:", res.type);
+        
         if (
           res.type === "conversation.item.input_audio_transcription.completed"
         ) {
@@ -295,7 +359,7 @@ fastify.register(async (fastify) => {
           if (callSid) {
             if (!callTranscriptMap.has(callSid))
               callTranscriptMap.set(callSid, []);
-              callTranscriptMap
+            callTranscriptMap
               .get(callSid)
               .push({ role: "agent", text: res.transcript });
           }
@@ -307,7 +371,7 @@ fastify.register(async (fastify) => {
             lowerTranscript.includes("have a nice day")
           ) {
             if (callSid) {
-              //Let the audio to finish playing before ending the call 6 sec pause
+              // Let the audio finish playing before ending the call (6 sec pause)
               setTimeout(async () => {
                 try {
                   await twilioClient
@@ -317,35 +381,19 @@ fastify.register(async (fastify) => {
                 } catch (err) {
                   console.error(`❌ Failed to end call ${callSid}:`, err);
                 }
+                
+                // Clean up contexts
                 callContextMap.delete(callSid);
+                if (context && context.phoneNumber) {
+                  phoneContextMap.delete(context.phoneNumber);
+                }
 
                 const conversation = callTranscriptMap.get(callSid);
-                // console.log(conversation)
-                // if (conversation) {
-                //   const formatted = conversation
-                //     .map(
-                //       (entry) =>
-                //         `${entry.role === "agent" ? "Agent" : "User"}: ${
-                //           entry.text
-                //         }`
-                //     )
-                //     .join("\n");
-
-                //   try {
-                //     await sgMail.send({
-                //       to: "youremail@example.com", // 🔁 Replace with your real email
-                //       from: "noreply@fasttrack.ai", // 🔁 Must be verified sender in SendGrid
-                //       subject: `Call Transcript for ${callSid}`,
-                //       text: formatted,
-                //     });
-
-                //     console.log(`📧 Transcript emailed for call ${callSid}`);
-                //   } catch (err) {
-                //     console.error("❌ Failed to send email:", err);
-                //   }
-
-                //   callTranscriptMap.delete(callSid);
-                // }
+                if (conversation) {
+                  console.log("📝 Call transcript:", conversation);
+                  // Here you can add email sending logic if needed
+                  callTranscriptMap.delete(callSid);
+                }
               }, 6000);
             } else {
               console.warn(`⚠️ callSid is missing, cannot end call.`);
@@ -392,9 +440,22 @@ fastify.register(async (fastify) => {
             latestMediaTimestamp = 0;
 
             callSid = msg.start.callSid;
-            const context = callContextMap.get(callSid);
+            
+            console.log("=== WEBSOCKET DEBUG ===");
             console.log("🔗 Got callSid:", callSid);
-            console.log("📦 Loaded context:", context);
+            console.log("🔗 Got phoneNumber:", phoneNumber);
+            console.log("📊 Available callSids:", Array.from(callContextMap.keys()));
+            console.log("📊 Available phone numbers:", Array.from(phoneContextMap.keys()));
+            console.log("=======================");
+
+            // Try multiple methods to find context
+            context = findContext(callSid, phoneNumber);
+            
+            if (context) {
+              console.log("✅ Successfully loaded context for session");
+            } else {
+              console.error("❌ Failed to load context - will ask for customer details");
+            }
 
             initializeSession(context);
             break;
@@ -410,9 +471,11 @@ fastify.register(async (fastify) => {
               );
             }
             break;
+            
           case "mark":
             markQueue.shift();
             break;
+            
           default:
             console.log("Unhandled event:", msg.event);
         }
@@ -422,36 +485,43 @@ fastify.register(async (fastify) => {
     });
 
     conn.on("close", async () => {
-  console.log(`🔌 Twilio WebSocket disconnected for callSid ${callSid}`);
+      console.log(`🔌 Twilio WebSocket disconnected for callSid ${callSid}`);
 
-  // Close OpenAI WebSocket if still open
-  if (openAiWs && openAiWs.readyState === WebSocket.OPEN) {
-    openAiWs.close();
-  }
+      // Close OpenAI WebSocket if still open
+      if (openAiWs && openAiWs.readyState === WebSocket.OPEN) {
+        openAiWs.close();
+      }
 
-  // End the call if it's still active
-  if (callSid) {
-    try {
-      await twilioClient.calls(callSid).update({ status: "completed" });
-      console.log(`✅ Call ${callSid} marked as completed on hangup.`);
-    } catch (err) {
-      console.error(`❌ Failed to mark call ${callSid} as completed:`, err);
-    }
+      // End the call if it's still active
+      if (callSid) {
+        try {
+          await twilioClient.calls(callSid).update({ status: "completed" });
+          console.log(`✅ Call ${callSid} marked as completed on hangup.`);
+        } catch (err) {
+          console.error(`❌ Failed to mark call ${callSid} as completed:`, err);
+        }
 
-    // Clean up memory
-    callContextMap.delete(callSid);
-    callTranscriptMap.delete(callSid);
-  }
-});
+        // Clean up both context maps
+        callContextMap.delete(callSid);
+        if (context && context.phoneNumber) {
+          phoneContextMap.delete(context.phoneNumber);
+        }
+        callTranscriptMap.delete(callSid);
+      }
+    });
 
     openAiWs.on("close", () => {
       console.log("OpenAI WebSocket connection closed");
       if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
       if (callSid) {
         callContextMap.delete(callSid);
+        if (context && context.phoneNumber) {
+          phoneContextMap.delete(context.phoneNumber);
+        }
       }
       console.log(`Connection closed for callSid ${callSid}`);
     });
+    
     openAiWs.on("error", (err) => console.error("OpenAI WS error:", err));
   });
 });
@@ -463,4 +533,3 @@ fastify.listen({ port: PORT || 3000, host: '0.0.0.0' }, (err, address) => {
   }
   fastify.log.info(`Server running at ${address}`);
 });
-
