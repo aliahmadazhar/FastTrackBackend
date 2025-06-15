@@ -110,9 +110,11 @@ fastify.all("/outgoing-call", async (req, reply) => {
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
       <Response>
-        <Say voice="Polly.Joanna">You are now connected with FAST TRACK AI assistant.</Say>
-        <Pause length="1"/>
+      <Pause length="1"/>  
+      <Say voice="Polly.Joanna">You are now connected with FAST TRACK AI assistant.</Say>
+        <Pause length="2"/>
         <Say voice="Polly.Joanna">Transfering your call to Fast Track Agent, Speak when you are ready.</Say>
+
         <Connect>
           <Stream url="wss://${deployedHost}/media-stream" />
         </Connect>
@@ -247,7 +249,7 @@ fastify.register(async (fastify) => {
     };
 
     // Enhanced context loading with retry mechanism
-    const loadContextWithRetry = (callSid, maxRetries = 20) => {
+    const loadContextWithRetry = (callSid, maxRetries = 25) => {
       let retries = 0;
       
       const tryLoadContext = () => {
