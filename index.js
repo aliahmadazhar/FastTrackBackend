@@ -13,7 +13,7 @@ const callTranscriptMap = new Map(); // Stores [{ role, text }] per callSid
 dotenv.config({ path: ".env" });
 const {
   OPENAI_API_KEY,
-  PORT = 5050,
+  PORT = 3000,
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
   TWILIO_PHONE_NUMBER,
@@ -62,8 +62,7 @@ fastify.post("/start-call", async (req, reply) => {
 
   try {
     const call = await twilioClient.calls.create({
-      url: `${process.env.BASE_URL}/outgoing-call`,
-
+       url: `${process.env.BASE_URL}/outgoing-call`,
       to,
       from: TWILIO_PHONE_NUMBER,
     });
@@ -89,7 +88,6 @@ fastify.post("/start-call", async (req, reply) => {
 
 fastify.all("/outgoing-call", async (req, reply) => {
   const deployedHost = process.env.BASE_URL.replace("https://", "");
-
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
       <Response>
@@ -257,7 +255,7 @@ fastify.register(async (fastify) => {
       try {
         const res = JSON.parse(data);
         //  /   console.log(res);
-        console.log("📨 OpenAI response:", res.type);
+        // console.log("📨 OpenAI response:", res.type);
         if (
           res.type === "conversation.item.input_audio_transcription.completed"
         ) {
@@ -278,7 +276,6 @@ fastify.register(async (fastify) => {
           if (callSid) {
             if (!callTranscriptMap.has(callSid))
               callTranscriptMap.set(callSid, []);
-            callTranscriptMap
               .get(callSid)
               .push({ role: "agent", text: res.transcript });
           }
@@ -303,7 +300,7 @@ fastify.register(async (fastify) => {
                 callContextMap.delete(callSid);
 
                 const conversation = callTranscriptMap.get(callSid);
-                console.log(conversation);
+                // console.log(conversation)
                 // if (conversation) {
                 //   const formatted = conversation
                 //     .map(
@@ -423,10 +420,11 @@ fastify.register(async (fastify) => {
   });
 });
 
-fastify.listen({ port: PORT, host: "0.0.0.0" }, (err) => {
+fastify.listen({ port: PORT || 3000, host: '0.0.0.0' }, (err, address) => {
   if (err) {
-    console.error(err);
+    fastify.log.error(err);
     process.exit(1);
   }
-  console.log(`Server listening on port ${PORT}`);
+  fastify.log.info(`Server running at ${address}`);
 });
+
