@@ -1,49 +1,42 @@
 import Fastify from "fastify";
-
 import WebSocket from "ws";
 import dotenv from "dotenv";
 import fastifyFormBody from "@fastify/formbody";
 import fastifyWs from "@fastify/websocket";
 import fastifyCors from "@fastify/cors";
 import twilio from "twilio";
-
-const callContextMap = new Map(); // Stores context per callSid
-const callTranscriptMap = new Map(); // Stores [{ role, text }] per callSid
+import { createClient } from "redis";
 
 dotenv.config({ path: ".env" });
+
 const requiredEnv = [
   "OPENAI_API_KEY",
   "TWILIO_AUTH_TOKEN",
   "TWILIO_ACCOUNT_SID",
   "TWILIO_PHONE_NUMBER",
-  "STREAM_URL",
-  "ELEVENLABS_API_KEY",
-  "ELEVENLABS_VOICE_ID",
-  "SENDGRID_API_KEY",
-  "FASTTRK_EMAIL",
   "BASE_URL",
-  "PORT"
+  "PORT",
+  "REDIS_URL", // add this to your .env for Redis connection
 ];
+
 for (const name of requiredEnv) {
   if (!process.env[name]) {
     console.error(`❌ Missing env variable: ${name}`);
     process.exit(1);
   }
 }
+
 const {
   OPENAI_API_KEY,
   PORT = 3000,
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
   TWILIO_PHONE_NUMBER,
+  BASE_URL,
+  REDIS_URL,
 } = process.env;
 
-if (
-  !OPENAI_API_KEY ||
-  !TWILIO_ACCOUNT_SID ||
-  !TWILIO_AUTH_TOKEN ||
-  !TWILIO_PHONE_NUMBER
-) {
+if (!OPENAI_API_KEY || !TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_PHONE_NUMBER) {
   console.error("Missing environment variables. Check your .env file.");
   process.exit(1);
 }
@@ -54,8 +47,40 @@ fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+
 const VOICE = "shimmer";
 
+// Initialize Redis client
+const redis = createClient({ url: REDIS_URL });
+redis.on("error", (err) => console.error("Redis Client Error", err));
+
+await redis.connect();
+
+// Helper functions to store/get context and transcripts in Redis
+async function saveCallContext(callSid, context) {
+  await redis.set(`callContext:${callSid}`, JSON.stringify(context), { EX: 3600 }); // expire 1 hour
+}
+async function getCallContext(callSid) {
+  const data = await redis.get(`callContext:${callSid}`);
+  return data ? JSON.parse(data) : null;
+}
+async function deleteCallContext(callSid) {
+  await redis.del(`callContext:${callSid}`);
+}
+
+async function appendCallTranscript(callSid, role, text) {
+  await redis.rPush(`callTranscript:${callSid}`, JSON.stringify({ role, text }));
+  await redis.expire(`callTranscript:${callSid}`, 3600);
+}
+async function getCallTranscript(callSid) {
+  const arr = await redis.lRange(`callTranscript:${callSid}`, 0, -1);
+  return arr.map((item) => JSON.parse(item));
+}
+async function deleteCallTranscript(callSid) {
+  await redis.del(`callTranscript:${callSid}`);
+}
+
+// HTTP routes
 fastify.get("/", async (req, reply) => {
   reply.send({ status: "Twilio Voice AI server running" });
 });
@@ -77,14 +102,13 @@ fastify.post("/start-call", async (req, reply) => {
     return reply.code(400).send({ error: 'Missing "to" phone number' });
   }
 
-  reply.send({ message: "Form validated, call will be initiated shortly" });
-
   try {
     const call = await twilioClient.calls.create({
-       url: `${process.env.BASE_URL}/outgoing-call`,
+      url: `${BASE_URL}/outgoing-call`,
       to,
       from: TWILIO_PHONE_NUMBER,
     });
+
     const context = {
       customerName,
       vehicleName,
@@ -96,41 +120,44 @@ fastify.post("/start-call", async (req, reply) => {
       policyNumber,
     };
 
-    callContextMap.set(call.sid, context);
-    console.log(`📞 Call SID: ${call.sid}`);
-    console.log("🗂️ Stored call context:", context);
+    await saveCallContext(call.sid, context);
+    fastify.log.info(`📞 Call SID: ${call.sid}`);
+    fastify.log.info("🗂️ Stored call context in Redis", context);
+
+    reply.send({ message: "Call initiated", callSid: call.sid });
   } catch (err) {
-    console.error("❌ Failed to start call:", err);
+    fastify.log.error("❌ Failed to start call:", err);
     reply.code(500).send({ error: "Failed to initiate call" });
   }
 });
 
 fastify.all("/outgoing-call", async (req, reply) => {
-  const deployedHost = process.env.BASE_URL.replace("https://", "");
+  const deployedHost = BASE_URL.replace(/^https?:\/\//, "");
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-      <Response>
-        <Say voice="Polly.Joanna">You are now connected with FAST TRACK AI assistant.</Say>
-        <Pause length="1"/>
-        <Say voice="Polly.Joanna">Transfering your call to Fast Track Agent, Speak when you are ready.</Say>
-        <Connect>
-          <Stream url="wss://${deployedHost}/media-stream" />
-        </Connect>
-      </Response>`;
+    <Response>
+      <Say voice="Polly.Joanna">You are now connected with FAST TRACK AI assistant.</Say>
+      <Pause length="1"/>
+      <Say voice="Polly.Joanna">Transferring your call to Fast Track Agent, Speak when you are ready.</Say>
+      <Connect>
+        <Stream url="wss://${deployedHost}/media-stream" />
+      </Connect>
+    </Response>`;
 
   reply.type("text/xml").send(twiml);
 });
 
-// WebSocket route for media stream
+// WebSocket route for Twilio media streaming
 fastify.register(async (fastify) => {
-  fastify.get("/media-stream", { websocket: true }, (conn, req) => {
+  fastify.get("/media-stream", { websocket: true }, async (conn, req) => {
     let streamSid = null;
     let latestMediaTimestamp = 0;
     let lastAssistantItem = null;
     let markQueue = [];
     let responseStartTimestampTwilio = null;
     let callSid = null;
-    let shouldEndCallAfterAudio = false;
+
+    // OpenAI Realtime WS connection
     const openAiWs = new WebSocket(
       "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
       {
@@ -141,12 +168,13 @@ fastify.register(async (fastify) => {
       }
     );
 
+    // Initialize OpenAI session with context
     const initializeSession = (context) => {
       let contextString = "";
+
       if (context) {
         const {
           customerName,
-          phoneNumber,
           vehicleName,
           rentalStartDate,
           rentalDays,
@@ -156,58 +184,45 @@ fastify.register(async (fastify) => {
           policyNumber,
         } = context;
 
-        console.log("📦 Context received:", context);
         contextString = `
-  You are and AI assistant to verfiy the persons car insurance details You are calling insurance comapnt to verify insurance coverage for ${customerName}.
-  Here are the rental and insurance details:
+You are an AI assistant verifying car insurance details. Calling the insurance company to verify coverage for ${customerName}.
 
-  - Customer Name: ${customerName}
-  - Vehicle: ${vehicleName}
-  - Rental start date: ${rentalStartDate}
-  - Rental duration: ${rentalDays} days
-  - State: ${state}
-  - Driver License: ${driverLicense}
-  - Insurance Provider: ${insuranceProvider}
-  - Policy Number: ${policyNumber}
+Rental and insurance details:
+- Customer Name: ${customerName}
+- Vehicle: ${vehicleName}
+- Rental start date: ${rentalStartDate}
+- Rental duration: ${rentalDays} days
+- State: ${state}
+- Driver License: ${driverLicense}
+- Insurance Provider: ${insuranceProvider}
+- Policy Number: ${policyNumber}
 
-  Start the conversation with a short, clear introduction like:
+Start with a clear introduction like:
+"Hi, I’m calling to verify insurance coverage for ${customerName}..."
 
-  "Hi, I’m calling to verify insurance coverage for ${customerName}. They are renting a ${vehicleName} starting on ${rentalStartDate} for ${rentalDays} days in ${state}. I’d like to ask a few questions to confirm coverage."
-
-  After the introduction, follow the steps below one at a time.
-  Ask **only one question at a time** and do **not proceed to the next until a valid answer is received**.
-  If the first question is not clearly answered or denied, plesae ask it again ultil got that details.
-  If you get interrupted by the user during the conversation, respond to theri query and then return to the verification questions.
-  Do not answer any out-of-context or unrelated questions. Stay strictly on topic.
-  `;
+Follow verification questions one by one, wait for valid answers before proceeding. Repeat if needed. Stay polite and on topic.
+`;
       }
 
       const SYSTEM_MESSAGE = `
-  ${contextString}
+${contextString}
 
-  Verification questions (ask and wait for confirmation before continuing):
+Verification questions (ask and wait for confirmation):
 
-  1. Can I provide you with their policy number and driver’s license number to verify their policy?
-    - Only proceed if the agent confirms that they can verify using the policy number and driver’s license.
-    - If the answer is unclear or denied, **end the verification attempt politely and do not continue.**
+1. Can I provide policy number and driver’s license to verify?
+  - Proceed only if confirmed; otherwise, end politely.
 
-  2. Does this policy have full coverage or liability only?
+2. Does policy have full coverage or liability only?
 
-  3. Can you verify that the customer’s policy will carry over to our rental vehicle and your company will cover comprehensive, collision, and/or physical damage to our vehicle while being rented — including theft or vandalism while in the renter’s care and custody?
+3. Verify if policy covers rental vehicle (comprehensive, collision, theft, vandalism).
 
-  4. Are you able to verify the renter’s liability limit amounts and confirm that it will carry over as well?
+4. Confirm renter’s liability limits carry over.
 
-  5. Can you confirm that they have an active policy that’s been effective for more than 30 days? (If not, ask if it would still provide coverage.)
+5. Confirm active policy > 30 days or if coverage still applies.
 
-  Once all answers are collected, say:
-  “Thank you for confirming and being of assistance today. Have a nice day, goodbye”
-
-  Notes:
-  - If the user asks a question about the customer’s policy, vehicle, dates, or license, you may respond based on the given data.
-  - Be polite, clear, and stick to one question at a time.
-  - If the user asks about unrelated topics, politely redirect them back to the verification questions.
-  - o 
-  `;
+Once done:
+"Thank you for confirming and being of assistance today. Have a nice day, goodbye."
+`;
 
       const sessionUpdate = {
         type: "session.update",
@@ -225,11 +240,11 @@ fastify.register(async (fastify) => {
         },
       };
 
-      openAiWs.on("open", () => {
-        console.log("✅ OpenAI WS connected!");
-        console.log("📨 Sending sessionUpdate to OpenAI", sessionUpdate);
+      if (openAiWs.readyState === WebSocket.OPEN) {
         openAiWs.send(JSON.stringify(sessionUpdate));
-      });
+      } else {
+        openAiWs.once("open", () => openAiWs.send(JSON.stringify(sessionUpdate)));
+      }
     };
 
     const handleSpeechStartedEvent = () => {
@@ -267,89 +282,72 @@ fastify.register(async (fastify) => {
       }
     };
 
-    openAiWs.on("message", (data) => {
-      const message = data.toString(); // ✅ convert buffer to string
-      // console.log("📨 Got message from OpenAI:", message);
-
+    openAiWs.on("message", async (data) => {
       try {
-        const res = JSON.parse(data);
-        //  /   console.log(res);
-        // console.log("📨 OpenAI response:", res.type);
-        if (
-          res.type === "conversation.item.input_audio_transcription.completed"
-        ) {
+        const res = JSON.parse(data.toString());
+
+        if (res.type === "conversation.item.input_audio_transcription.completed") {
           const userSpeech = res.transcript;
           if (callSid) {
-            if (!callTranscriptMap.has(callSid))
-              callTranscriptMap.set(callSid, []);
-            callTranscriptMap
-              .get(callSid)
-              .push({ role: "user", text: userSpeech });
+            await appendCallTranscript(callSid, "user", userSpeech);
           }
         }
 
         if (res.type === "response.audio_transcript.done") {
-          console.log("[Full Transcript]", res.transcript);
+          const transcript = res.transcript;
+          const lowerTranscript = transcript.toLowerCase();
 
-          const lowerTranscript = res.transcript.toLowerCase();
+          fastify.log.info(`[Full Transcript] ${transcript}`);
+
           if (callSid) {
-            if (!callTranscriptMap.has(callSid))
-              callTranscriptMap.set(callSid, []);
-              callTranscriptMap
-              .get(callSid)
-              .push({ role: "agent", text: res.transcript });
+            await appendCallTranscript(callSid, "agent", transcript);
           }
 
-          // Check if the transcript includes any goodbye phrases
+          // Detect goodbye phrases to end call
           if (
             lowerTranscript.includes("goodbye") ||
             lowerTranscript.includes("take care") ||
             lowerTranscript.includes("have a nice day")
           ) {
-            if (callSid) {
-              //Let the audio to finish playing before ending the call 6 sec pause
-              setTimeout(async () => {
+            // Delay call hangup to allow audio to finish
+            setTimeout(async () => {
+              if (callSid) {
                 try {
-                  await twilioClient
-                    .calls(callSid)
-                    .update({ status: "completed" });
-                  console.log(`✅ Call ${callSid} ended by AI after delay.`);
+                  await twilioClient.calls(callSid).update({ status: "completed" });
+                  fastify.log.info(`✅ Call ${callSid} ended by AI after delay.`);
                 } catch (err) {
-                  console.error(`❌ Failed to end call ${callSid}:`, err);
+                  fastify.log.error(`❌ Failed to end call ${callSid}:`, err);
                 }
-                callContextMap.delete(callSid);
 
-                const conversation = callTranscriptMap.get(callSid);
-                // console.log(conversation)
-                // if (conversation) {
-                //   const formatted = conversation
-                //     .map(
-                //       (entry) =>
-                //         `${entry.role === "agent" ? "Agent" : "User"}: ${
-                //           entry.text
-                //         }`
-                //     )
-                //     .join("\n");
+                // Cleanup context & transcript
+                await deleteCallContext(callSid);
 
-                //   try {
-                //     await sgMail.send({
-                //       to: "youremail@example.com", // 🔁 Replace with your real email
-                //       from: "noreply@fasttrack.ai", // 🔁 Must be verified sender in SendGrid
-                //       subject: `Call Transcript for ${callSid}`,
-                //       text: formatted,
-                //     });
+                // Optionally, email transcript here (uncomment and configure SendGrid)
+                /*
+                const conversation = await getCallTranscript(callSid);
+                if (conversation) {
+                  const formatted = conversation
+                    .map((entry) => `${entry.role === "agent" ? "Agent" : "User"}: ${entry.text}`)
+                    .join("\n");
 
-                //     console.log(`📧 Transcript emailed for call ${callSid}`);
-                //   } catch (err) {
-                //     console.error("❌ Failed to send email:", err);
-                //   }
+                  try {
+                    await sgMail.send({
+                      to: "youremail@example.com",
+                      from: "noreply@fasttrack.ai",
+                      subject: `Call Transcript for ${callSid}`,
+                      text: formatted,
+                    });
+                    fastify.log.info(`📧 Transcript emailed for call ${callSid}`);
+                  } catch (err) {
+                    fastify.log.error("❌ Failed to send email:", err);
+                  }
 
-                //   callTranscriptMap.delete(callSid);
-                // }
-              }, 6000);
-            } else {
-              console.warn(`⚠️ callSid is missing, cannot end call.`);
-            }
+                  await deleteCallTranscript(callSid);
+                }
+                */
+                await deleteCallTranscript(callSid);
+              }
+            }, 6000);
           }
         }
 
@@ -377,11 +375,11 @@ fastify.register(async (fastify) => {
           handleSpeechStartedEvent();
         }
       } catch (e) {
-        console.error("Error handling OpenAI message", e);
+        fastify.log.error("Error handling OpenAI message", e);
       }
     });
 
-    conn.on("message", (message) => {
+    conn.on("message", async (message) => {
       try {
         const msg = JSON.parse(message);
 
@@ -392,9 +390,9 @@ fastify.register(async (fastify) => {
             latestMediaTimestamp = 0;
 
             callSid = msg.start.callSid;
-            const context = callContextMap.get(callSid);
-            console.log("🔗 Got callSid:", callSid);
-            console.log("📦 Loaded context:", context);
+            const context = await getCallContext(callSid);
+            fastify.log.info(`🔗 Got callSid: ${callSid}`);
+            fastify.log.info("📦 Loaded context:", context);
 
             initializeSession(context);
             break;
@@ -410,57 +408,59 @@ fastify.register(async (fastify) => {
               );
             }
             break;
+
           case "mark":
             markQueue.shift();
             break;
+
           default:
-            console.log("Unhandled event:", msg.event);
+            fastify.log.warn(`Unhandled event: ${msg.event}`);
         }
       } catch (e) {
-        console.error("Error parsing message", e);
+        fastify.log.error("Error parsing message", e);
       }
     });
 
     conn.on("close", async () => {
-  console.log(`🔌 Twilio WebSocket disconnected for callSid ${callSid}`);
+      fastify.log.info(`🔌 Twilio WebSocket disconnected for callSid ${callSid}`);
 
-  // Close OpenAI WebSocket if still open
-  if (openAiWs && openAiWs.readyState === WebSocket.OPEN) {
-    openAiWs.close();
-  }
+      // Close OpenAI WS connection
+      if (openAiWs && openAiWs.readyState === WebSocket.OPEN) {
+        openAiWs.close();
+      }
 
-  // End the call if it's still active
-  if (callSid) {
-    try {
-      await twilioClient.calls(callSid).update({ status: "completed" });
-      console.log(`✅ Call ${callSid} marked as completed on hangup.`);
-    } catch (err) {
-      console.error(`❌ Failed to mark call ${callSid} as completed:`, err);
-    }
+      if (callSid) {
+        try {
+          // Mark call complete on Twilio side if still active
+          await twilioClient.calls(callSid).update({ status: "completed" });
+          fastify.log.info(`✅ Call ${callSid} marked as completed on hangup.`);
+        } catch (err) {
+          fastify.log.error(`❌ Failed to mark call ${callSid} as completed:`, err);
+        }
 
-    // Clean up memory
-    callContextMap.delete(callSid);
-    callTranscriptMap.delete(callSid);
-  }
-});
+        // Clean up Redis
+        await deleteCallContext(callSid);
+        await deleteCallTranscript(callSid);
+      }
+    });
 
     openAiWs.on("close", () => {
-      console.log("OpenAI WebSocket connection closed");
+      fastify.log.info(`OpenAI WebSocket connection closed for callSid ${callSid}`);
       if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
+
       if (callSid) {
-        callContextMap.delete(callSid);
+        deleteCallContext(callSid);
       }
-      console.log(`Connection closed for callSid ${callSid}`);
     });
-    openAiWs.on("error", (err) => console.error("OpenAI WS error:", err));
+
+    openAiWs.on("error", (err) => fastify.log.error("OpenAI WS error:", err));
   });
 });
 
-fastify.listen({ port: PORT || 3000, host: '0.0.0.0' }, (err, address) => {
+fastify.listen({ port: PORT || 3000, host: "0.0.0.0" }, (err, address) => {
   if (err) {
     fastify.log.error(err);
     process.exit(1);
   }
   fastify.log.info(`Server running at ${address}`);
 });
-
