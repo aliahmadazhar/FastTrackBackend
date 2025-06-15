@@ -9,6 +9,25 @@ import twilio from "twilio";
 
 const callContextMap = new Map(); // Stores context per callSid
 const callTranscriptMap = new Map(); // Stores [{ role, text }] per callSid
+const waitForCallContext = async (callSid, maxAttempts = 20, interval = 100) => {
+  let attempt = 0;
+
+  return new Promise((resolve, reject) => {
+    const check = () => {
+      const context = callContextMap.get(callSid);
+      if (context) return resolve(context);
+
+      attempt++;
+      if (attempt >= maxAttempts) {
+        return reject(new Error(`Context for callSid ${callSid} not found after ${maxAttempts} attempts`));
+      }
+
+      setTimeout(check, interval);
+    };
+
+    check();
+  });
+};
 
 dotenv.config({ path: ".env" });
 const requiredEnv = [
@@ -111,7 +130,7 @@ fastify.all("/outgoing-call", async (req, reply) => {
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
       <Response>
         <Say voice="Polly.Joanna">You are now connected with FAST TRACK AI assistant.</Say>
-        <Pause length="2"/>
+        <Pause length="1"/>
         <Say voice="Polly.Joanna">Transfering your call to Fast Track Agent, Speak when you are ready.</Say>
         <Connect>
           <Stream url="wss://${deployedHost}/media-stream" />
@@ -386,7 +405,25 @@ fastify.register(async (fastify) => {
         const msg = JSON.parse(message);
 
         switch (msg.event) {
-          case "start":
+        case "start":
+  streamSid = msg.start.streamSid;
+  responseStartTimestampTwilio = null;
+  latestMediaTimestamp = 0;
+
+  callSid = msg.start.callSid;
+  console.log("🔗 Got callSid:", callSid);
+
+  waitForCallContext(callSid)
+    .then((context) => {
+      console.log("📦 Loaded context after waiting:", context);
+      initializeSession(context);
+    })
+    .catch((err) => {
+      console.error("❌ Failed to load context:", err.message);
+      // Optional: end call early or speak an error message
+    });
+  break;
+
             streamSid = msg.start.streamSid;
             responseStartTimestampTwilio = null;
             latestMediaTimestamp = 0;
