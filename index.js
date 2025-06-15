@@ -78,40 +78,31 @@ fastify.post("/start-call", async (req, reply) => {
   }
 
   reply.send({ message: "Form validated, call will be initiated shortly" });
-const context = {
-  customerName,
-  vehicleName,
-  rentalStartDate,
-  rentalDays,
-  state,
-  driverLicense,
-  insuranceProvider,
-  policyNumber,
-};
 
-// Save context with a temporary key BEFORE making the call
-const dummyCallSid = `pending_${Date.now()}_${Math.random()}`;
-callContextMap.set(dummyCallSid, context);
+  try {
+    const call = await twilioClient.calls.create({
+       url: `${process.env.BASE_URL}/outgoing-call`,
+      to,
+      from: TWILIO_PHONE_NUMBER,
+    });
+    const context = {
+      customerName,
+      vehicleName,
+      rentalStartDate,
+      rentalDays,
+      state,
+      driverLicense,
+      insuranceProvider,
+      policyNumber,
+    };
 
-reply.send({ message: "Form validated, call will be initiated shortly" });
-
-try {
-  const call = await twilioClient.calls.create({
-    url: `${process.env.BASE_URL}/outgoing-call`,
-    to,
-    from: TWILIO_PHONE_NUMBER,
-  });
-
-  // Move context to actual callSid after call is created
-  callContextMap.set(call.sid, callContextMap.get(dummyCallSid));
-  callContextMap.delete(dummyCallSid);
-
-  console.log(`📞 Call SID: ${call.sid}`);
-  console.log("🗂️ Stored call context:", callContextMap.get(call.sid));
-} catch (err) {
-  console.error("❌ Failed to start call:", err);
-  reply.code(500).send({ error: "Failed to initiate call" });
-}
+    callContextMap.set(call.sid, context);
+    console.log(`📞 Call SID: ${call.sid}`);
+    console.log("🗂️ Stored call context:", context);
+  } catch (err) {
+    console.error("❌ Failed to start call:", err);
+    reply.code(500).send({ error: "Failed to initiate call" });
+  }
 });
 
 fastify.all("/outgoing-call", async (req, reply) => {
