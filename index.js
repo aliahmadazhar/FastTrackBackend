@@ -22,7 +22,7 @@ const requiredEnv = [
   "SENDGRID_API_KEY",
   "FASTTRK_EMAIL",
   "BASE_URL",
-  "PORT"
+  "PORT",
 ];
 for (const name of requiredEnv) {
   if (!process.env[name]) {
@@ -81,7 +81,7 @@ fastify.post("/start-call", async (req, reply) => {
 
   try {
     const call = await twilioClient.calls.create({
-       url: `${process.env.BASE_URL}/outgoing-call`,
+      url: `${process.env.BASE_URL}/outgoing-call`,
       to,
       from: TWILIO_PHONE_NUMBER,
     });
@@ -295,7 +295,7 @@ fastify.register(async (fastify) => {
           if (callSid) {
             if (!callTranscriptMap.has(callSid))
               callTranscriptMap.set(callSid, []);
-              callTranscriptMap
+            callTranscriptMap
               .get(callSid)
               .push({ role: "agent", text: res.transcript });
           }
@@ -421,7 +421,7 @@ fastify.register(async (fastify) => {
       }
     });
 
-    conn.on("close", async () => {
+   conn.on("close", async () => {
   console.log(`🔌 Twilio WebSocket disconnected for callSid ${callSid}`);
 
   // Close OpenAI WebSocket if still open
@@ -429,7 +429,7 @@ fastify.register(async (fastify) => {
     openAiWs.close();
   }
 
-  // End the call if it's still active
+  // DO NOT DELETE CONTEXT HERE - ONLY END CALL IF NEEDED
   if (callSid) {
     try {
       await twilioClient.calls(callSid).update({ status: "completed" });
@@ -437,13 +437,8 @@ fastify.register(async (fastify) => {
     } catch (err) {
       console.error(`❌ Failed to mark call ${callSid} as completed:`, err);
     }
-
-    // Clean up memory
-    callContextMap.delete(callSid);
-    callTranscriptMap.delete(callSid);
   }
 });
-
     openAiWs.on("close", () => {
       console.log("OpenAI WebSocket connection closed");
       if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
@@ -456,11 +451,10 @@ fastify.register(async (fastify) => {
   });
 });
 
-fastify.listen({ port: PORT || 3000, host: '0.0.0.0' }, (err, address) => {
+fastify.listen({ port: PORT || 3000, host: "0.0.0.0" }, (err, address) => {
   if (err) {
     fastify.log.error(err);
     process.exit(1);
   }
   fastify.log.info(`Server running at ${address}`);
 });
-
