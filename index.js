@@ -247,7 +247,7 @@ fastify.register(async (fastify) => {
     };
 
     // Enhanced context loading with retry mechanism
-    const loadContextWithRetry = (callSid, maxRetries = 5) => {
+    const loadContextWithRetry = (callSid, maxRetries = 20) => {
       let retries = 0;
       
       const tryLoadContext = () => {
@@ -446,6 +446,7 @@ fastify.register(async (fastify) => {
       if (callSid) {
         try {
           await twilioClient.calls(callSid).update({ status: "completed" });
+          callContextMap.delete(callSid);
           console.log(`✅ Call ${callSid} marked as completed on hangup.`);
         } catch (err) {
           console.error(`❌ Failed to mark call ${callSid} as completed:`, err);
