@@ -7,8 +7,9 @@ import fastifyWs from "@fastify/websocket";
 import fastifyCors from "@fastify/cors";
 import twilio from "twilio";
 
-const callContextMap = new Map(); // Stores context per callSid
-const callTranscriptMap = new Map(); // Stores [{ role, text }] per callSid
+import Redis from "ioredis";
+// const callContextMap = new Map(); // Stores context per callSid
+ const callTranscriptMap = new Map(); // Stores [{ role, text }] per callSid
 
 dotenv.config({ path: ".env" });
 const {
@@ -17,17 +18,32 @@ const {
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
   TWILIO_PHONE_NUMBER,
+  REDIS_URL
 } = process.env;
 
 if (
   !OPENAI_API_KEY ||
   !TWILIO_ACCOUNT_SID ||
   !TWILIO_AUTH_TOKEN ||
-  !TWILIO_PHONE_NUMBER
+  !TWILIO_PHONE_NUMBER ||
+  !REDIS_URL
 ) {
   console.error("Missing environment variables. Check your .env file.");
   process.exit(1);
 }
+
+// Redis setup
+const redis = new Redis(REDIS_URL);
+const storeCallContext = async (callSid, context) => {
+  await redis.set(`call_context:${callSid}`, JSON.stringify(context), 'EX', 3600);
+};
+const getCallContext = async (callSid) => {
+  const raw = await redis.get(`call_context:${callSid}`);
+  return raw ? JSON.parse(raw) : null;
+};
+const deleteCallContext = async (callSid) => {
+  await redis.del(`call_context:${callSid}`);
+};
 
 const fastify = Fastify({ logger: true });
 fastify.register(fastifyCors);
@@ -62,7 +78,8 @@ fastify.post("/start-call", async (req, reply) => {
 
   try {
     const call = await twilioClient.calls.create({
-       url: `${process.env.BASE_URL}/outgoing-call`,
+      // 1368-154-80-30-9.ngrok-free.app
+      url: `${process.env.BASE_URL}/outgoing-call`,
       to,
       from: TWILIO_PHONE_NUMBER,
     });
@@ -77,9 +94,9 @@ fastify.post("/start-call", async (req, reply) => {
       policyNumber,
     };
 
-    callContextMap.set(call.sid, context);
+    await storeCallContext(call.sid, context);
     console.log(`📞 Call SID: ${call.sid}`);
-    console.log("🗂️ Stored call context:", context);
+    console.log("🗂️ Stored call context to Redis:", context);
   } catch (err) {
     console.error("❌ Failed to start call:", err);
     reply.code(500).send({ error: "Failed to initiate call" });
@@ -87,7 +104,8 @@ fastify.post("/start-call", async (req, reply) => {
 });
 
 fastify.all("/outgoing-call", async (req, reply) => {
-  const deployedHost = process.env.BASE_URL.replace("https://", "");
+  // const deployedHost = "1368-154-80-30-9.ngrok-free.app";
+  process.env.BASE_URL.replace("https://", "");
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
       <Response>
@@ -298,7 +316,7 @@ fastify.register(async (fastify) => {
                 } catch (err) {
                   console.error(`❌ Failed to end call ${callSid}:`, err);
                 }
-                callContextMap.delete(callSid);
+                // callContextMap.delete(callSid);
 
                 const conversation = callTranscriptMap.get(callSid);
                 // console.log(conversation)
@@ -362,61 +380,68 @@ fastify.register(async (fastify) => {
       }
     });
 
-    conn.on("message", (message) => {
-      try {
-        const msg = JSON.parse(message);
+   conn.on("message", async (message) => {
+  try {
+    const msg = JSON.parse(message);
 
-        switch (msg.event) {
-          case "start":
-            streamSid = msg.start.streamSid;
-            responseStartTimestampTwilio = null;
-            latestMediaTimestamp = 0;
+    switch (msg.event) {
+      case "start":
+        streamSid = msg.start.streamSid;
+        responseStartTimestampTwilio = null;
+        latestMediaTimestamp = 0;
 
-            callSid = msg.start.callSid;
-            const context = callContextMap.get(callSid);
-            console.log("🔗 Got callSid:", callSid);
-            console.log("📦 Loaded context:", context);
+        callSid = msg.start.callSid;
+        const context = await getCallContext(callSid);   
+        console.log("📦 Loaded context from Redis:", context);
+        initializeSession(context);
+        break;
 
-            initializeSession(context);
-            break;
-
-          case "media":
-            latestMediaTimestamp = msg.media.timestamp;
-            if (openAiWs.readyState === WebSocket.OPEN) {
-              openAiWs.send(
-                JSON.stringify({
-                  type: "input_audio_buffer.append",
-                  audio: msg.media.payload,
-                })
-              );
-            }
-            break;
-          case "mark":
-            markQueue.shift();
-            break;
-          default:
-            console.log("Unhandled event:", msg.event);
+      case "media":
+        latestMediaTimestamp = msg.media.timestamp;
+        if (openAiWs.readyState === WebSocket.OPEN) {
+          openAiWs.send(
+            JSON.stringify({
+              type: "input_audio_buffer.append",
+              audio: msg.media.payload,
+            })
+          );
         }
-      } catch (e) {
-        console.error("Error parsing message", e);
-      }
-    });
+        break;
 
-    conn.on("close", () => {
-      if (callSid) {
-        callContextMap.delete(callSid);
-      }
-      console.log(`Connection closed for callSid ${callSid}`);
-    });
+      case "mark":
+        markQueue.shift();
+        break;
 
-    openAiWs.on("close", () => {
-      console.log("OpenAI WebSocket connection closed");
-      if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
-      if (callSid) {
-        callContextMap.delete(callSid);
-      }
-      console.log(`Connection closed for callSid ${callSid}`);
-    });
+      default:
+        console.log("Unhandled event:", msg.event);
+    }
+  } catch (e) {
+    console.error("Error parsing message", e);
+  }
+});
+
+conn.on("close", () => {
+  (async () => {
+    if (callSid) {
+      await deleteCallContext(callSid);
+      console.log(`🧹 Redis context deleted for ${callSid}`);
+    }
+    console.log(`Connection closed for callSid ${callSid}`);
+  })();
+});
+
+openAiWs.on("close", () => {
+  (async () => {
+    console.log("OpenAI WebSocket connection closed");
+    if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
+    if (callSid) {
+      await deleteCallContext(callSid);
+      console.log(`🧹 Redis context deleted (on AI close) for ${callSid}`);
+    }
+    console.log(`Connection closed for callSid ${callSid}`);
+  })();
+});
+
     openAiWs.on("error", (err) => console.error("OpenAI WS error:", err));
   });
 });
