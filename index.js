@@ -9,7 +9,7 @@ import twilio from "twilio";
 
 import Redis from "ioredis";
 // const callContextMap = new Map(); // Stores context per callSid
- const callTranscriptMap = new Map(); // Stores [{ role, text }] per callSid
+const callTranscriptMap = new Map(); // Stores [{ role, text }] per callSid
 
 dotenv.config({ path: ".env" });
 const {
@@ -18,7 +18,7 @@ const {
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
   TWILIO_PHONE_NUMBER,
-  REDIS_URL
+  REDIS_URL,
 } = process.env;
 
 if (
@@ -35,7 +35,12 @@ if (
 // Redis setup
 const redis = new Redis(REDIS_URL);
 const storeCallContext = async (callSid, context) => {
-  await redis.set(`call_context:${callSid}`, JSON.stringify(context), 'EX', 3600);
+  await redis.set(
+    `call_context:${callSid}`,
+    JSON.stringify(context),
+    "EX",
+    3600
+  );
 };
 const getCallContext = async (callSid) => {
   const raw = await redis.get(`call_context:${callSid}`);
@@ -43,6 +48,48 @@ const getCallContext = async (callSid) => {
 };
 const deleteCallContext = async (callSid) => {
   await redis.del(`call_context:${callSid}`);
+};
+
+const formatDateNatural = (rawDate) => {
+  const date = new Date(rawDate);
+  const day = date.getDate();
+  const month = date.toLocaleDateString("en-US", { month: "long" });
+
+  // Convert day to ordinal (1st, 2nd, 3rd, etc)
+  const suffixes = ["th", "st", "nd", "rd"];
+  const suffix = suffixes[(day - 20) % 10] || suffixes[day] || suffixes[0];
+
+  return `${month} ${day}${suffix}`;
+};
+
+const formatPriceNatural = (priceStr) => {
+  // Handle different price formats: "86k", "$86,000", "86000"
+  const cleanPrice = priceStr.replace(/[^\dkK.]/gi, "").toLowerCase();
+
+  if (cleanPrice.includes("k")) {
+    const numValue = parseFloat(cleanPrice.replace("k", "")) * 1000;
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: "USD",
+      maximumFractionDigits: 0,
+    }).format(numValue);
+  }
+
+  const numValue = parseFloat(cleanPrice);
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    maximumFractionDigits: 0,
+  }).format(numValue);
+};
+
+// 2. Update the vehicle parsing logic
+const parseVehicleInfo = (vehicleStr) => {
+  const [namePart, pricePart] = vehicleStr.split("-").map((s) => s.trim());
+  return {
+    vehicleName: namePart,
+    vehiclePrice: pricePart ? formatPriceNatural(pricePart) : null,
+  };
 };
 
 const fastify = Fastify({ logger: true });
@@ -104,9 +151,8 @@ fastify.post("/start-call", async (req, reply) => {
 });
 
 fastify.all("/outgoing-call", async (req, reply) => {
-   const deployedHost = process.env.BASE_URL.replace("https://", "");
-   //"1368-154-80-30-9.ngrok-free.app";
-  
+  const deployedHost = process.env.BASE_URL.replace("https://", "");
+  //"1368-154-80-30-9.ngrok-free.app";
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
       <Response>
@@ -157,6 +203,24 @@ fastify.register(async (fastify) => {
         } = context;
 
         console.log("📦 Context received:", context);
+        const { vehicletype, vehiclePrice } = parseVehicleInfo(
+          context.vehicleName
+        );
+
+        // Format dates naturally
+        const startDateNatural = formatDateNatural(context.rentalStartDate);
+        const daysNatural =
+          context.rentalDays === "1" ? "one day" : `${context.rentalDays} days`;
+
+        // Build natural language strings
+        const vehicleDesc = vehiclePrice
+          ? `${vehicletype} valued at ${vehiclePrice}`
+          : vehicletype;
+
+        const introPhrase = `Hi, I'm calling to verify insurance coverage for ${context.customerName}. 
+    They are renting a ${vehicleDesc} starting on ${startDateNatural} for ${daysNatural} in ${context.state}. 
+    I'd like to ask a few questions to confirm coverage.`;
+
         contextString = `
   You are and AI assistant to verfiy the persons car insurance details You are calling insurance comapnt to verify insurance coverage for ${customerName}.
   Here are the rental and insurance details:
@@ -170,10 +234,7 @@ fastify.register(async (fastify) => {
   - Insurance Provider: ${insuranceProvider}
   - Policy Number: ${policyNumber}
 
-  Start the conversation with a short, clear introduction like:
-
-  "Hi, I’m calling to verify insurance coverage for ${customerName}. They are renting a ${vehicleName} starting on ${rentalStartDate} for ${rentalDays} days in ${state}. I’d like to ask a few questions to confirm coverage."
-
+  Start the conversation with a short, clear introduction like: Start the conversation with: "${introPhrase}"
   After the introduction, follow the steps below one at a time.
   Ask **only one question at a time** and do **not proceed to the next until a valid answer is received**.
   If the first question is not clearly answered or denied, plesae ask it again ultil got that details.
@@ -295,7 +356,7 @@ fastify.register(async (fastify) => {
           if (callSid) {
             if (!callTranscriptMap.has(callSid))
               callTranscriptMap.set(callSid, []);
-              callTranscriptMap
+            callTranscriptMap
               .get(callSid)
               .push({ role: "agent", text: res.transcript });
           }
@@ -381,77 +442,76 @@ fastify.register(async (fastify) => {
       }
     });
 
-   conn.on("message", async (message) => {
-  try {
-    const msg = JSON.parse(message);
+    conn.on("message", async (message) => {
+      try {
+        const msg = JSON.parse(message);
 
-    switch (msg.event) {
-      case "start":
-        streamSid = msg.start.streamSid;
-        responseStartTimestampTwilio = null;
-        latestMediaTimestamp = 0;
+        switch (msg.event) {
+          case "start":
+            streamSid = msg.start.streamSid;
+            responseStartTimestampTwilio = null;
+            latestMediaTimestamp = 0;
 
-        callSid = msg.start.callSid;
-        const context = await getCallContext(callSid);   
-        console.log("📦 Loaded context from Redis:", context);
-        initializeSession(context);
-        break;
+            callSid = msg.start.callSid;
+            const context = await getCallContext(callSid);
+            console.log("📦 Loaded context from Redis:", context);
+            initializeSession(context);
+            break;
 
-      case "media":
-        latestMediaTimestamp = msg.media.timestamp;
-        if (openAiWs.readyState === WebSocket.OPEN) {
-          openAiWs.send(
-            JSON.stringify({
-              type: "input_audio_buffer.append",
-              audio: msg.media.payload,
-            })
-          );
+          case "media":
+            latestMediaTimestamp = msg.media.timestamp;
+            if (openAiWs.readyState === WebSocket.OPEN) {
+              openAiWs.send(
+                JSON.stringify({
+                  type: "input_audio_buffer.append",
+                  audio: msg.media.payload,
+                })
+              );
+            }
+            break;
+
+          case "mark":
+            markQueue.shift();
+            break;
+
+          default:
+            console.log("Unhandled event:", msg.event);
         }
-        break;
+      } catch (e) {
+        console.error("Error parsing message", e);
+      }
+    });
 
-      case "mark":
-        markQueue.shift();
-        break;
+    conn.on("close", () => {
+      (async () => {
+        if (callSid) {
+          await deleteCallContext(callSid);
+          console.log(`🧹 Redis context deleted for ${callSid}`);
+        }
+        console.log(`Connection closed for callSid ${callSid}`);
+      })();
+    });
 
-      default:
-        console.log("Unhandled event:", msg.event);
-    }
-  } catch (e) {
-    console.error("Error parsing message", e);
-  }
-});
-
-conn.on("close", () => {
-  (async () => {
-    if (callSid) {
-      await deleteCallContext(callSid);
-      console.log(`🧹 Redis context deleted for ${callSid}`);
-    }
-    console.log(`Connection closed for callSid ${callSid}`);
-  })();
-});
-
-openAiWs.on("close", () => {
-  (async () => {
-    console.log("OpenAI WebSocket connection closed");
-    if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
-    if (callSid) {
-      await deleteCallContext(callSid);
-      console.log(`🧹 Redis context deleted (on AI close) for ${callSid}`);
-    }
-    console.log(`Connection closed for callSid ${callSid}`);
-  })();
-});
+    openAiWs.on("close", () => {
+      (async () => {
+        console.log("OpenAI WebSocket connection closed");
+        if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
+        if (callSid) {
+          await deleteCallContext(callSid);
+          console.log(`🧹 Redis context deleted (on AI close) for ${callSid}`);
+        }
+        console.log(`Connection closed for callSid ${callSid}`);
+      })();
+    });
 
     openAiWs.on("error", (err) => console.error("OpenAI WS error:", err));
   });
 });
 
-fastify.listen({ port: PORT || 3000, host: '0.0.0.0' }, (err, address) => {
+fastify.listen({ port: PORT || 3000, host: "0.0.0.0" }, (err, address) => {
   if (err) {
     fastify.log.error(err);
     process.exit(1);
   }
   fastify.log.info(`Server running at ${address}`);
 });
-
