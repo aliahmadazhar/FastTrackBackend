@@ -104,8 +104,9 @@ fastify.post("/start-call", async (req, reply) => {
 });
 
 fastify.all("/outgoing-call", async (req, reply) => {
-  // const deployedHost = "1368-154-80-30-9.ngrok-free.app";
-  process.env.BASE_URL.replace("https://", "");
+   const deployedHost = process.env.BASE_URL.replace("https://", "");
+   //"1368-154-80-30-9.ngrok-free.app";
+  
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
       <Response>
