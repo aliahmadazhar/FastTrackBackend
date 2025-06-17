@@ -7,10 +7,7 @@ import fastifyWs from "@fastify/websocket";
 import fastifyCors from "@fastify/cors";
 import twilio from "twilio";
 
-import Redis from "ioredis";
-// const callContextMap = new Map(); // Stores context per callSid
-const callTranscriptMap = new Map(); // Stores [{ role, text }] per callSid
-
+import Redis from "ioredis"; 
 dotenv.config({ path: ".env" });
 const {
   OPENAI_API_KEY,
@@ -50,6 +47,20 @@ const deleteCallContext = async (callSid) => {
   await redis.del(`call_context:${callSid}`);
 };
 
+//Transcript functions for Redis
+const storeTranscriptEntry = async (callSid, entry) => {
+  await redis.rpush(`transcript:${callSid}`, JSON.stringify(entry));
+  await redis.expire(`transcript:${callSid}`, 3600); // Expire in 1 hour
+};
+
+const getTranscript = async (callSid) => {
+  const items = await redis.lrange(`transcript:${callSid}`, 0, -1);
+  return items.map(JSON.parse);
+};
+
+const deleteTranscript = async (callSid) => {
+  await redis.del(`transcript:${callSid}`);
+};
 const formatDateNatural = (rawDate) => {
   const date = new Date(rawDate);
   const day = date.getDate();
@@ -328,24 +339,22 @@ fastify.register(async (fastify) => {
       }
     };
 
-    openAiWs.on("message", (data) => {
+    openAiWs.on("message", async (data) => {
       const message = data.toString(); // ✅ convert buffer to string
-      // console.log("📨 Got message from OpenAI:", message);
 
       try {
         const res = JSON.parse(data);
-        //  /   console.log(res);
-        // console.log("📨 OpenAI response:", res.type);
+
         if (
           res.type === "conversation.item.input_audio_transcription.completed"
         ) {
           const userSpeech = res.transcript;
+
           if (callSid) {
-            if (!callTranscriptMap.has(callSid))
-              callTranscriptMap.set(callSid, []);
-            callTranscriptMap
-              .get(callSid)
-              .push({ role: "user", text: userSpeech });
+            await storeTranscriptEntry(callSid, {
+              role: "user",
+              text: userSpeech,
+            });
           }
         }
 
@@ -354,21 +363,18 @@ fastify.register(async (fastify) => {
 
           const lowerTranscript = res.transcript.toLowerCase();
           if (callSid) {
-            if (!callTranscriptMap.has(callSid))
-              callTranscriptMap.set(callSid, []);
-            callTranscriptMap
-              .get(callSid)
-              .push({ role: "agent", text: res.transcript });
+            await storeTranscriptEntry(callSid, {
+              role: "agent",
+              text: res.transcript,
+            });
           }
 
-          // Check if the transcript includes any goodbye phrases
           if (
             lowerTranscript.includes("goodbye") ||
             lowerTranscript.includes("take care") ||
             lowerTranscript.includes("have a nice day")
           ) {
             if (callSid) {
-              //Let the audio to finish playing before ending the call 6 sec pause
               setTimeout(async () => {
                 try {
                   await twilioClient
@@ -378,35 +384,28 @@ fastify.register(async (fastify) => {
                 } catch (err) {
                   console.error(`❌ Failed to end call ${callSid}:`, err);
                 }
-                // callContextMap.delete(callSid);
 
-                const conversation = callTranscriptMap.get(callSid);
-                // console.log(conversation)
-                // if (conversation) {
-                //   const formatted = conversation
-                //     .map(
-                //       (entry) =>
-                //         `${entry.role === "agent" ? "Agent" : "User"}: ${
-                //           entry.text
-                //         }`
-                //     )
-                //     .join("\n");
+                try {
+                  const conversation = await getTranscript(callSid);
+                  console.log("📜 Full conversation transcript:", conversation);
+                  // Uncomment below to send the email if needed
+                  /*
+              const formatted = conversation
+                .map((entry) => `${entry.role === "agent" ? "Agent" : "User"}: ${entry.text}`)
+                .join("\n");
 
-                //   try {
-                //     await sgMail.send({
-                //       to: "youremail@example.com", // 🔁 Replace with your real email
-                //       from: "noreply@fasttrack.ai", // 🔁 Must be verified sender in SendGrid
-                //       subject: `Call Transcript for ${callSid}`,
-                //       text: formatted,
-                //     });
+              await sgMail.send({
+                to: "youremail@example.com",
+                from: "noreply@fasttrack.ai",
+                subject: `Call Transcript for ${callSid}`,
+                text: formatted,
+              });
 
-                //     console.log(`📧 Transcript emailed for call ${callSid}`);
-                //   } catch (err) {
-                //     console.error("❌ Failed to send email:", err);
-                //   }
-
-                //   callTranscriptMap.delete(callSid);
-                // }
+              console.log(`📧 Transcript emailed for call ${callSid}`);
+              */
+                } catch (e) {
+                  console.error("❌ Failed to handle post-call tasks:", e);
+                }
               }, 6000);
             } else {
               console.warn(`⚠️ callSid is missing, cannot end call.`);
@@ -487,6 +486,8 @@ fastify.register(async (fastify) => {
         if (callSid) {
           await deleteCallContext(callSid);
           console.log(`🧹 Redis context deleted for ${callSid}`);
+          await deleteTranscript(callSid); // Add this line
+          console.log(`🧹 Redis context & transcript deleted for ${callSid}`);
         }
         console.log(`Connection closed for callSid ${callSid}`);
       })();
