@@ -6,6 +6,7 @@ import fastifyFormBody from "@fastify/formbody";
 import fastifyWs from "@fastify/websocket";
 import fastifyCors from "@fastify/cors";
 import twilio from "twilio";
+import sgMail from "@sendgrid/mail";
 
 import Redis from "ioredis";
 dotenv.config({ path: ".env" });
@@ -17,8 +18,7 @@ const {
   TWILIO_PHONE_NUMBER,
   REDIS_URL,
 } = process.env;
-
-const sgMail = require("@sendgrid/mail");
+ 
 sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 
 if (
