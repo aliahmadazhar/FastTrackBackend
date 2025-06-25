@@ -7,7 +7,7 @@ import fastifyWs from "@fastify/websocket";
 import fastifyCors from "@fastify/cors";
 import twilio from "twilio";
 
-import Redis from "ioredis"; 
+import Redis from "ioredis";
 dotenv.config({ path: ".env" });
 const {
   OPENAI_API_KEY,
@@ -17,6 +17,9 @@ const {
   TWILIO_PHONE_NUMBER,
   REDIS_URL,
 } = process.env;
+
+const sgMail = require("@sendgrid/mail");
+sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 
 if (
   !OPENAI_API_KEY ||
@@ -389,20 +392,31 @@ fastify.register(async (fastify) => {
                   const conversation = await getTranscript(callSid);
                   console.log("📜 Full conversation transcript:", conversation);
                   // Uncomment below to send the email if needed
-                  /*
-              const formatted = conversation
-                .map((entry) => `${entry.role === "agent" ? "Agent" : "User"}: ${entry.text}`)
-                .join("\n");
 
-              await sgMail.send({
-                to: "youremail@example.com",
-                from: "noreply@fasttrack.ai",
-                subject: `Call Transcript for ${callSid}`,
-                text: formatted,
-              });
+                  const formatted = conversation
+                    .map(
+                      (entry) =>
+                        `${entry.role === "agent" ? "Agent" : "User"}: ${
+                          entry.text
+                        }`
+                    )
+                    .join("\n");
+                  const msg = {
+                    to: "founder@fasttrk.ai",
+                    from: "noreply@em1191.fasttrk.ai",
+                    subject: `Call Transcript for ${callSid}`,
+                    text: formatted,
+                  };
+                  sgMail
+                    .send(msg)
+                    .then(() => {
+                      console.log("✅ Email sent successfully.");
+                    })
+                    .catch((error) => {
+                      console.error("❌ Error sending email:", error);
+                    });
 
-              console.log(`📧 Transcript emailed for call ${callSid}`);
-              */
+                  console.log(`📧 Transcript emailed for call ${callSid}`);
                 } catch (e) {
                   console.error("❌ Failed to handle post-call tasks:", e);
                 }
