@@ -18,7 +18,7 @@ const {
   TWILIO_PHONE_NUMBER,
   REDIS_URL,
 } = process.env;
- 
+
 sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 
 if (
@@ -401,9 +401,10 @@ fastify.register(async (fastify) => {
                         }`
                     )
                     .join("\n");
+                
                   const msg = {
-                    to: "founder@fasttrk.ai",
-                    from: "noreply@em1191.fasttrk.ai",
+                    to: ["founder@fasttrk.ai", "Ike@turboexotics.com"],  
+                    from: "noreply@em1191.fasttrk.ai", 
                     subject: `Call Transcript for ${callSid}`,
                     text: formatted,
                   };
